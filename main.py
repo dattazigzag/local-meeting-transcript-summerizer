@@ -9,6 +9,7 @@ import sys
 import argparse
 from pathlib import Path
 from dotenv import load_dotenv
+from ollama import Client
 
 # Import the core functions from our pipeline modules
 from pipeline.step1_convert import convert
@@ -108,7 +109,19 @@ def main():
 
         print("-" * 40)
         print(f"✅ Pipeline Complete! Final summary saved to:\n{final_path.absolute()}")
-
+        
+        print("\nEjecting models from VRAM...")
+        client = Client(host=ollama_host)
+        
+        # Use a set to avoid trying to unload the same model twice if editor == extractor
+        models_used = {args.editor_model, args.extractor_model}
+        for m in models_used:
+            try:
+                # Sending keep_alive=0 frees the model from memory
+                client.generate(model=m, keep_alive=0)
+                print(f"  - Successfully unloaded: {m}")
+            except Exception as e:
+                print(f"  - Note: Could not confirm unload for {m}: {e}")
     except KeyboardInterrupt:
         print("\n\n⚠️ Pipeline interrupted by user. Exiting.")
         sys.exit(1)
