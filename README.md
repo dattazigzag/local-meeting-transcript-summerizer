@@ -90,12 +90,49 @@ uv run 05_agent3_formatter.py output/extracted_files/<MeetingTranscript_extracte
 
 ---
 
-## Advanced CLI Usage
+## ⚙️ Advanced CLI Usage
 
-All AI agents (02, 04, 05) support CLI overrides for the model and the host URL. The scripts will automatically detect if you are using a Gemma or Qwen model and apply the optimized system prompt.
+All AI agents (`02`, `04`, `05`) support CLI overrides for the model and the host URL. The scripts will automatically detect if you are using a Gemma or Qwen model and apply the optimized system prompt.
 
 > [!Warning] 
 > As of April, 2026, the internal system prompts are tailored to `gemma4:26b` and `qwen3.5:27b`. If using a different model or even same family models with higher or lower weights, you might need to adjust the system prompts via experimentation or develop / tweak affordance of the respective agent scripts. 
+
+### Mixing and Matching Models (The "Best of Both Worlds" Strategy)
+Because different LLMs excel at different cognitive tasks, you are not locked into a single model for the entire pipeline. 
+
+For example, Gemma models are historically fantastic at natural language smoothing and narrative flow, making them ideal for formatting. Qwen models are highly logical and obedient to structural constraints, making them perfect for exhaustive data extraction. 
+
+You can leverage this by switching the `--model` argument at each step:
+
+```bash
+# Step 2: Use Gemma for natural, grammatical text cleanup
+uv run 02_agent1_cleanup.py output/raw_files/Meeting.md \
+    --out-dir output/cleaned_files/ \
+    --model gemma4:26b
+
+# Step 4: Switch to Qwen for rigid, exhaustive data extraction
+uv run 04_agent2_extraction.py output/named_files/Meeting_named.md \
+    --out-dir output/extracted_files/ \
+    --model qwen3.5:27b
+
+# Step 5: Switch back to Gemma for polished, corporate document formatting
+uv run 05_agent3_formatter.py output/extracted_files/Meeting_extracted.md \
+    --out-dir output/final_summaries/ \
+    --model gemma4:26b
+```
+
+### Customizing the Ollama Host
+
+If you are running Ollama on a dedicated home server, a secondary GPU rig, or within a specific Docker network, you can override the default local URL using the `--host` flag:
+
+```bash
+uv run 02_agent1_cleanup.py input.md --host http://<your_ollama_host_ADDR>:<your_ollama_host_PORT>
+```
+
+### Batch Processing and Chaining
+
+Because every step in this pipeline is an isolated CLI command with distinct input/output directories, you can easily wrap these commands into a simple bash script (`.sh`). This allows you to process multiple transcripts sequentially, only halting the script for the human-in-the-loop speaker mapping ([Step 3](#step-3-speaker-mapping-human-in-the-loop)).
+
 
 ## Directory Structure
 
