@@ -106,7 +106,24 @@ All AI agents (`02`, `04`, `05`) support CLI overrides for the model and the hos
 > [!Warning] 
 > As of April, 2026, the internal system prompts are tailored to `gemma4:26b` and `qwen3.5:27b`. If using a different model or even same family models with higher or lower weights, you might need to adjust the system prompts via experimentation or develop / tweak affordance of the respective agent scripts. 
 
+### The Master Orchestrator (main.py)
+
+Because every step in this pipeline is modular, you do not need to run the individual scripts one by one. You can use the master orchestrator to run the entire pipeline end-to-end. 
+
+It will automatically build the output directories, process the transcript, pause to ask you for speaker names, and then generate the final summary.
+
+```bash
+# Run the full pipeline with default models
+uv run main.py transcripts/MeetingTranscript.rtf
+
+# Run the full pipeline using the Mix-and-Match model strategy
+uv run main.py transcripts/MeetingTranscript.rtf \
+    --editor-model gemma4:26b \
+    --extractor-model qwen3.5:27b
+```
+
 ### Mixing and Matching Models (The "Best of Both Worlds" Strategy)
+
 Because different LLMs excel at different cognitive tasks, you are not locked into a single model for the entire pipeline. 
 
 For example, Gemma models are historically fantastic at natural language smoothing and narrative flow, making them ideal for formatting. Qwen models are highly logical and obedient to structural constraints, making them perfect for exhaustive data extraction. 
@@ -137,25 +154,6 @@ If you are running Ollama on a dedicated home server, a secondary GPU rig, or wi
 ```bash
 uv run step2_cleanup.py input.md --host http://<your_ollama_host_ADDR>:<your_ollama_host_PORT>
 ```
-
-### Batch Processing and Chaining
-
-### 🚀 The Master Orchestrator (main.py)
-
-Because every step in this pipeline is modular, you do not need to run the individual scripts one by one. You can use the master orchestrator to run the entire pipeline end-to-end. 
-
-It will automatically build the output directories, process the transcript, pause to ask you for speaker names, and then generate the final summary.
-
-```bash
-# Run the full pipeline with default models
-uv run main.py transcripts/MeetingTranscript.rtf
-
-# Run the full pipeline using the Mix-and-Match model strategy
-uv run main.py transcripts/MeetingTranscript.rtf \
-    --editor-model gemma4:26b \
-    --extractor-model qwen3.5:27b
-```
-
 
 ## Directory Structure
 
