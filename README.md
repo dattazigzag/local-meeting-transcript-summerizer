@@ -30,13 +30,20 @@ During the development of this pipeline, several critical discoveries shaped the
 
 * **Python 3.8+**
 * **[uv](https://github.com/astral-sh/uv)** (Python package manager)
-* **[Ollama](https://ollama.com/)** running locally or on your network (Default expects: `http://<YOUR OLLAMA IP>:11434`)
+  ```bash
+  # on a mac it would be, after installing uv
+  uv sync
+  ```
+* **[Ollama](https://ollama.com/)** running locally or on your network (Default expects: `http://<YOUR OLLAMA IP>:<YOUR OLLAMA PORT>`)
 * **Local Models:** Pull your preferred models in Ollama:
   
   ```bash
   ollama pull gemma4:26b
   ollama pull qwen3.5:27b
    ```
+
+    > [!Warning] 
+    > As of April, 2026, the internal system prompts are tailored to `gemma4:26b` and `qwen3.5:27b`. If using a different model or even same family models with higher or lower weights, you might need to adjust the system prompts via experimentation or develop / tweak affordance of the respective agent scripts. 
 
 ## The 5-Step Pipeline Workflow
 
