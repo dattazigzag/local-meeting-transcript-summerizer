@@ -25,6 +25,7 @@ This pass (M6.5 round 4):
 from __future__ import annotations
 
 import atexit
+import base64
 import contextlib
 import io
 import os
@@ -995,6 +996,80 @@ def run_pipeline_generator(
 
 # ─── MCP-exposed tool ──────────────────────────────────────────────────
 
+def _materialize_input(src: str, dest_dir: Path) -> Path:
+    """Resolve the ``file`` argument to a local file inside ``dest_dir``.
+
+    Accepts three formats so MCP clients aren't forced to have
+    filesystem access to the server:
+
+      * ``data:<mime>;base64,<payload>`` — decoded and written to
+        ``dest_dir``. Extension is ``.rtf`` if ``rtf`` appears in the
+        mimetype, else ``.md`` (the two formats step 1 accepts).
+      * ``http://...`` / ``https://...`` — streamed to ``dest_dir`` via
+        httpx, preserving the URL's basename. Step 1 will reject if the
+        resulting filename doesn't end in ``.md`` or ``.rtf``.
+      * anything else — interpreted as a path on the SERVER's
+        filesystem (NOT the MCP client's). Must exist.
+
+    Raises:
+        ValueError: for unknown prefixes, missing local files,
+            malformed data URIs, or failed downloads.
+    """
+    src = (src or "").strip()
+    if not src:
+        raise ValueError("Empty `file` argument")
+
+    if src.startswith("data:"):
+        # data:<mime>;base64,<payload>
+        try:
+            header, payload = src.split(",", 1)
+        except ValueError as e:
+            raise ValueError("Malformed data URI (missing comma)") from e
+        if ";base64" not in header:
+            raise ValueError(
+                "Only base64-encoded data URIs are supported "
+                "(header must contain ';base64')"
+            )
+        mime = header[5:].split(";", 1)[0] or "text/plain"
+        ext = ".rtf" if "rtf" in mime.lower() else ".md"
+        try:
+            data = base64.b64decode(payload, validate=True)
+        except Exception as e:
+            raise ValueError(f"Invalid base64 payload: {e}") from e
+        out = dest_dir / f"upload{ext}"
+        out.write_bytes(data)
+        return out
+
+    if src.startswith(("http://", "https://")):
+        # Use the URL's path segment as the filename so step 1 can
+        # detect the format via extension.
+        url_path = src.split("?", 1)[0].rstrip("/")
+        name = url_path.rsplit("/", 1)[-1] or "download"
+        out = dest_dir / name
+        print(f"Downloading {src} → {out.name}...")
+        try:
+            with httpx.stream(
+                "GET", src, follow_redirects=True, timeout=30.0
+            ) as r:
+                r.raise_for_status()
+                with open(out, "wb") as f:
+                    for chunk in r.iter_bytes():
+                        f.write(chunk)
+        except httpx.HTTPError as e:
+            raise ValueError(f"Download failed: {e}") from e
+        return out
+
+    # Otherwise: a path on the server's filesystem.
+    p = Path(src)
+    if not p.exists():
+        raise ValueError(
+            f"Unrecognised `file` argument {src!r} — expected a "
+            f"'data:...', 'http(s)://...', or an existing local path on "
+            f"the server's filesystem."
+        )
+    return p
+
+
 def summarize_transcript(
     file: str,
     editor_model: str = DEFAULT_EDITOR_MODEL,
@@ -1025,10 +1100,24 @@ def summarize_transcript(
     or pass ``speaker_map={"Speaker 1": "Alice", "Speaker 2": "Bob"}``.
 
     Args:
-        file: Path or URL to a .rtf (Moonshine export) or .md (local
-            transcriber output) transcript. Gradio's MCP transport
-            accepts public URLs and base64-encoded uploads and
-            materialises them to a local path before calling.
+        file: Transcript source. Accepts three formats so the MCP
+            client doesn't need filesystem access to the server:
+
+              * ``data:<mime>;base64,<payload>`` — base64-encoded file
+                content inlined in the request. Use ``application/rtf``
+                mimetype for Moonshine RTF exports; anything else is
+                treated as markdown. Good for small transcripts.
+              * ``http://...`` or ``https://...`` — public URL the
+                server can fetch. Good for cross-machine tool calls
+                (e.g. MCP client on a laptop hits a Gradio server on
+                a LAN host; serve the transcript over
+                ``python -m http.server`` or an equivalent).
+              * anything else — an absolute path on the SERVER's
+                filesystem (NOT the MCP client's). Must exist.
+
+            Resulting filename must end in ``.rtf`` (Moonshine export)
+            or ``.md`` (local transcriber output); step 1 rejects
+            everything else.
         editor_model: Ollama model tag for the cleanup step (step 2).
             Defaults to ``gemma4:26b``.
         extractor_model: Ollama model tag for the extraction (step 4)
@@ -1067,10 +1156,6 @@ def summarize_transcript(
     if not ok:
         raise ValueError(msg)
 
-    input_path = Path(file)
-    if not input_path.exists():
-        raise ValueError(f"Input file not found: {file}")
-
     # Fresh tempdir per call — no session state to hang onto.
     tempdir = Path(tempfile.mkdtemp(prefix="meeting_summarizer_mcp_"))
     models_used = {editor_model, extractor_model}
@@ -1078,6 +1163,19 @@ def summarize_transcript(
     # interrupted mid-flight (matches UI behaviour).
     for m in models_used:
         _ALL_MODELS_EVER_LOADED.add((host, m))
+
+    # Resolve the ``file`` arg to a local file in tempdir. Handles
+    # base64 data URIs, http(s) URLs, or plain server paths. Raises
+    # ValueError for unknown prefixes / missing paths / failed fetches.
+    # See ``_materialize_input``.
+    raw_dir = tempdir / "raw_files"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        input_path = _materialize_input(file, raw_dir)
+    except ValueError:
+        # Nothing loaded yet — just clean the tempdir and re-raise.
+        shutil.rmtree(tempdir, ignore_errors=True)
+        raise
 
     # Terminal banner so CLI operators watching `uv run app.py` see a
     # clear start / end for each MCP call. Mirrors main.py's
@@ -1088,8 +1186,9 @@ def summarize_transcript(
     try:
         # ── Step 1/5: ingest ──────────────────────────────────────────────────
         announce(1, 5, "Ingesting transcript to Markdown")
-        raw_dir = tempdir / "raw_files"
-        raw_dir.mkdir(parents=True, exist_ok=True)
+        # raw_dir already exists from _materialize_input; reuse it so
+        # the materialized input and step1's normalized output sit
+        # alongside each other.
         try:
             _, canonical_md = convert(input_path, raw_dir)
         except SystemExit as e:
