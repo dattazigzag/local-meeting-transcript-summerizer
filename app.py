@@ -10,16 +10,10 @@ Run:
 
 Then open http://localhost:7860 in a browser.
 
-Status: M6 — Cancellation + unload + session hooks.
-All of M3–M5 plus: a Stop button visible during runs that cancels the
-in-flight generator; a ``cleanup_session`` hook attached to ``gr.State``'s
-``delete_callback`` that fires when Gradio GCs a session (~60 min after
-a tab closes, per Gradio 6's session-GC window), ejecting that session's
-models and removing its tempdir; process-level ``atexit`` + SIGTERM
-handlers that walk the module-level set of every ``(host, model)``
-touched during the process lifetime and unload them on shutdown.
-Non-streaming Ollama calls mean cancellation mid-step waits for the
-current step to return before models eject — accepted per spec F3.
+Status: M6 complete · M6.5 in progress.
+Current pass (M6.5): S1 Copy-as-markdown-source, S2 top banner accordion,
+S3 stable intermediate filenames. Layout-touching items (M1, M2, L1) are
+deferred to a wireframe round later in this milestone.
 """
 
 from __future__ import annotations
@@ -71,6 +65,14 @@ OLLAMA_PROBE_TIMEOUT = 3.0
 # no per-component size kwarg (issue #7825).
 UPLOAD_MAX_SIZE = "10mb"
 
+# Stable intermediate-file stem used by steps 2→5. Keeps the
+# `input_md.stem.replace("_cleaned"/"_named"/"_extracted", …)` chain in the
+# pipeline modules from producing ugly filenames when the upload's original
+# stem happens to contain those substrings (M6.5 S3 fix). The user-visible
+# download name uses ``uploaded_stem`` verbatim, so this is invisible from
+# the outside — it only affects files inside the session tempdir.
+STABLE_STEM = "transcript"
+
 
 # ─── Process-level tracking for shutdown hooks ────────────────────────────
 
@@ -94,22 +96,25 @@ FORCE_DARK_MODE_JS = """
 }
 """
 
-# JS fired by the Copy button. Reads the rendered summary's innerText and
-# puts it on the clipboard. Uses innerText (not innerHTML) so the user gets
-# clean, human-readable text rather than HTML tags. The elem_id here MUST
-# match the gr.Markdown elem_id below (``final-summary``).
-#
-# Note: M6.5 S1 deferred UX item — this currently strips markdown syntax.
-# A hidden Textbox mirror will be added in M6.5.
+# JS fired by the Copy button. Reads the raw markdown source from a hidden
+# gr.Textbox rather than the rendered ``final-summary`` markdown's innerText,
+# so the clipboard gets ``# Heading`` / ``**bold**`` / ``| table |`` syntax
+# intact. The ``final-summary-source`` elem_id is mirrored in build_demo.
+# Gradio wraps the Textbox value inside a <textarea>; .value gives the raw
+# content. (M6.5 S1 fix; previously copied innerText which stripped syntax.)
 COPY_SUMMARY_JS = """
 () => {
-    const el = document.getElementById('final-summary');
-    if (!el) {
-        console.warn('final-summary element not found');
+    const host = document.getElementById('final-summary-source');
+    if (!host) {
+        console.warn('final-summary-source element not found');
         return;
     }
-    const text = el.innerText || '';
-    navigator.clipboard.writeText(text);
+    const ta = host.querySelector('textarea');
+    if (!ta) {
+        console.warn('final-summary-source textarea not found');
+        return;
+    }
+    navigator.clipboard.writeText(ta.value || '');
 }
 """
 
@@ -415,9 +420,12 @@ def on_test_connection(host: str) -> tuple[str, dict]:
 def on_stop(state_val: dict[str, Any]) -> tuple:
     """Stop-button click handler.
 
-    Returns a 7-tuple matching the Run button's output layout. Re-enables
-    Run, hides Stop, and writes a cancellation status line. The actual
-    cancellation of the in-flight generator is done by Gradio's
+    Returns an 8-tuple matching the Run button's output layout, with the
+    extra slot being ``final_summary_source`` (hidden textbox used for
+    markdown-source clipboard copy). Re-enables Run, hides Stop, clears
+    the summary + source, writes a cancellation status line.
+
+    The actual cancellation of the in-flight generator is done by Gradio's
     ``cancels=[run_event]`` wiring on the Stop button's .click. The
     generator's ``finally`` block ejects models on GeneratorExit.
 
@@ -429,7 +437,8 @@ def on_stop(state_val: dict[str, Any]) -> tuple:
     """
     return (
         gr.update(value="⏸ Cancelled by user.", visible=True),   # run_status
-        gr.update(visible=False),                                # final_summary_md
+        gr.update(value="", visible=False),                      # final_summary_md
+        gr.update(value=""),                                     # final_summary_source (stays "hidden")
         gr.update(visible=False),                                # copy_btn
         gr.update(value=None, visible=False),                    # download_btn
         gr.update(interactive=True),                             # run_btn
@@ -438,11 +447,18 @@ def on_stop(state_val: dict[str, Any]) -> tuple:
     )
 
 
-# Empty updates for the four run-output components, used by on_file_upload
+# Empty updates for the five run-output components, used by on_file_upload
 # to clear stale results when a new file is uploaded or the upload is cleared.
+# (Grew from 4 to 5 entries at M6.5 when final_summary_source was added.)
+#
+# NOTE for final_summary_source: we pass value-only updates (no `visible=`)
+# everywhere because the component lives in the DOM permanently as
+# visible="hidden". Flipping it to False would yank the <textarea> out of
+# the DOM and break the Copy button's JS lookup.
 _RUN_OUTPUT_RESET = (
     gr.update(value="", visible=False),   # run_status
     gr.update(value="", visible=False),   # final_summary_md
+    gr.update(value=""),                  # final_summary_source (stays "hidden")
     gr.update(visible=False),             # copy_btn
     gr.update(value=None, visible=False), # download_btn
 )
@@ -457,7 +473,7 @@ def on_file_upload(
     Runs step1_convert into the session tempdir, renders preview, detects
     generic speakers, enables Run if ingest succeeded.
 
-    Returns an 11-tuple in this order to match the event listener's outputs:
+    Returns a 12-tuple in this order to match the event listener's outputs:
         preview_md update,
         error_md update,
         run_btn update,
@@ -467,6 +483,7 @@ def on_file_upload(
         meta_md update,
         run_status update,          (reset — stale after new upload)
         final_summary_md update,    (reset)
+        final_summary_source update,(reset — S1)
         copy_btn update,            (reset)
         download_btn update         (reset)
 
@@ -567,9 +584,13 @@ def run_pipeline_generator(
 ) -> Iterator[tuple]:
     """Run steps 2 → 5 on the session's ingested transcript.
 
-    Generator: yields a 7-tuple at each phase boundary matching the Run
-    button's outputs list (run_status, final_summary_md, copy_btn,
-    download_btn, run_btn, session_state, stop_btn).
+    Generator: yields an 8-tuple at each phase boundary matching the Run
+    button's outputs list (run_status, final_summary_md, final_summary_source,
+    copy_btn, download_btn, run_btn, session_state, stop_btn).
+
+    The ``final_summary_source`` slot is a hidden gr.Textbox that mirrors
+    the raw markdown source; Copy button JS reads its textarea value so
+    the clipboard gets markdown syntax, not stripped innerText (S1 fix).
 
     On pre-flight failure, yields once with an error and stops — no
     try/finally entered, so no models are touched.
@@ -586,6 +607,11 @@ def run_pipeline_generator(
 
     Non-streaming Ollama calls mean cancellation during a step is blocked
     until the step returns — accepted trade-off per spec F3 / Risks.
+
+    Intermediate files in the session tempdir use a stable stem
+    (``STABLE_STEM = "transcript"``) so downstream ``stem.replace(...)``
+    logic in step modules behaves predictably regardless of the upload's
+    original filename (M6.5 S3 fix).
     """
     # ── Pre-flight ────────────────────────────────────────────────────────
     if not state_val.get("canonical_md"):
@@ -594,12 +620,13 @@ def run_pipeline_generator(
                 value="❌ No transcript ingested. Upload a file first.",
                 visible=True,
             ),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(interactive=True),
+            gr.update(visible=False),              # final_summary_md
+            gr.update(value=""),                   # final_summary_source (stays "hidden")
+            gr.update(visible=False),              # copy_btn
+            gr.update(visible=False),              # download_btn
+            gr.update(interactive=True),           # run_btn
             state_val,
-            gr.update(visible=False),  # stop_btn: nothing to cancel
+            gr.update(visible=False),              # stop_btn: nothing to cancel
         )
         return
 
@@ -608,6 +635,7 @@ def run_pipeline_generator(
         yield (
             gr.update(value=f"❌ Pre-flight failed: {msg}", visible=True),
             gr.update(visible=False),
+            gr.update(value=""),                   # final_summary_source (stays "hidden")
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(interactive=True),
@@ -628,9 +656,10 @@ def run_pipeline_generator(
     _ALL_MODELS_EVER_LOADED.add((ollama_host, extractor_model))
     state_val["run_in_progress"] = True
 
-    # Stable yields for "no change on this output" — keeps the 7-tuple shape
+    # Stable yields for "no change on this output" — keeps the 8-tuple shape
     # consistent without re-clobbering fields we don't want to touch.
     NOOP_FINAL = gr.update()
+    NOOP_SOURCE = gr.update()
     NOOP_COPY = gr.update()
     NOOP_DOWNLOAD = gr.update()
 
@@ -639,7 +668,7 @@ def run_pipeline_generator(
         progress(0.0, desc="Cleaning transcript…")
         yield (
             gr.update(value="**Step 1/4** · Cleaning transcript…", visible=True),
-            NOOP_FINAL, NOOP_COPY, NOOP_DOWNLOAD,
+            NOOP_FINAL, NOOP_SOURCE, NOOP_COPY, NOOP_DOWNLOAD,
             gr.update(interactive=False),
             state_val,
             gr.update(visible=True),  # stop_btn visible throughout the run
@@ -650,12 +679,22 @@ def run_pipeline_generator(
             editor_model,
             ollama_host,
         )
+        # S3 fix: rename step 2's output to a stable stem before chaining.
+        # step 2 writes `{input.stem}_cleaned.md`; if `input.stem` happens
+        # to contain `_cleaned` or `_named` (e.g. user's `yt_video_en.named`
+        # test file), the downstream stem-replace logic in step 4/5
+        # misbehaves. Renaming to `transcript_cleaned.md` here means
+        # step 3 → 4 → 5 all operate on predictable stems.
+        stable_cleaned_path = cleaned_path.parent / f"{STABLE_STEM}_cleaned.md"
+        if cleaned_path != stable_cleaned_path:
+            cleaned_path.rename(stable_cleaned_path)
+            cleaned_path = stable_cleaned_path
 
         # Step 3: pure, in-memory speaker mapping. No Ollama call.
         progress(0.25, desc="Applying speaker names…")
         yield (
             gr.update(value="**Step 2/4** · Applying speaker names…", visible=True),
-            NOOP_FINAL, NOOP_COPY, NOOP_DOWNLOAD,
+            NOOP_FINAL, NOOP_SOURCE, NOOP_COPY, NOOP_DOWNLOAD,
             gr.update(interactive=False),
             state_val,
             gr.update(visible=True),
@@ -664,16 +703,17 @@ def run_pipeline_generator(
         named_text = apply_speaker_mapping(cleaned_text, speaker_map or {})
         named_dir = tempdir / "named"
         named_dir.mkdir(parents=True, exist_ok=True)
-        # Mirror the CLI's stem convention so step4's strip of "_named" works
-        # out to the original uploaded_stem.
-        named_stem = cleaned_path.stem.replace("_cleaned", "_named")
-        named_path = named_dir / f"{named_stem}.md"
+        # Use STABLE_STEM directly (not a replace on cleaned_path.stem) —
+        # the S3 rename above guarantees cleaned_path.stem is exactly
+        # `transcript_cleaned`, but hardcoding is clearer and makes the
+        # intent explicit to the next reader.
+        named_path = named_dir / f"{STABLE_STEM}_named.md"
         named_path.write_text(named_text, encoding="utf-8")
 
         progress(0.50, desc="Extracting information…")
         yield (
             gr.update(value="**Step 3/4** · Extracting information…", visible=True),
-            NOOP_FINAL, NOOP_COPY, NOOP_DOWNLOAD,
+            NOOP_FINAL, NOOP_SOURCE, NOOP_COPY, NOOP_DOWNLOAD,
             gr.update(interactive=False),
             state_val,
             gr.update(visible=True),
@@ -688,7 +728,7 @@ def run_pipeline_generator(
         progress(0.75, desc="Formatting summary…")
         yield (
             gr.update(value="**Step 4/4** · Formatting final summary…", visible=True),
-            NOOP_FINAL, NOOP_COPY, NOOP_DOWNLOAD,
+            NOOP_FINAL, NOOP_SOURCE, NOOP_COPY, NOOP_DOWNLOAD,
             gr.update(interactive=False),
             state_val,
             gr.update(visible=True),
@@ -716,7 +756,8 @@ def run_pipeline_generator(
         progress(1.0, desc="Done")
         yield (
             gr.update(value="✅ Summary ready.", visible=True),
-            gr.update(value=final_content, visible=True),
+            gr.update(value=final_content, visible=True),   # rendered markdown
+            gr.update(value=final_content),                  # raw source for Copy
             gr.update(visible=True),
             gr.update(value=str(download_path), visible=True),
             gr.update(interactive=True),
@@ -736,6 +777,7 @@ def run_pipeline_generator(
                 visible=True,
             ),
             gr.update(visible=False),
+            gr.update(value=""),                   # final_summary_source (stays "hidden")
             gr.update(visible=False),
             gr.update(visible=False),
             gr.update(interactive=True),
@@ -812,10 +854,20 @@ def build_demo() -> gr.Blocks:
 
             gr.Markdown("# Local Meeting Summarizer")
             gr.Markdown(
-                "Upload a `.rtf` from Moonshine or `.md` from the local "
-                "transcriber. Files above 10 MB are rejected; ~2.5h of speech "
+                "Upload an exported meeting transcript (`.rtf`) from [moonshine-notetaker](https://note-taker.moonshine.ai/) or from the zz's local "
+                "transcriber (`.md`). Files above 10 MB are rejected; ~2.5h of speech "
                 "is the practical ceiling (LLM context window)."
             )
+
+            # S2: multi-tab note moved from the old footer sub to a
+            # collapsed accordion near the top — visible but unobtrusive.
+            with gr.Accordion("Good to know", open=True):
+                gr.Markdown(
+                    "Each tab runs independently — multiple tabs = multiple "
+                    "queue slots. When you close the tab, the models your "
+                    "session loaded and its temp files are cleaned up "
+                    "automatically (within about an hour)."
+                )
 
             # ── Upload ────────────────────────────────────────────────────
             upload = gr.File(
@@ -882,7 +934,7 @@ def build_demo() -> gr.Blocks:
                     )
 
             # Run + Stop share a row. Stop sits next to Run (hidden until
-            # a run is active). M6.5 UX pass will likely reshuffle this.
+            # a run is active). M6.5 layout round may reshuffle this.
             with gr.Row():
                 run_btn = gr.Button(
                     "Run",
@@ -907,7 +959,31 @@ def build_demo() -> gr.Blocks:
                 "",
                 label="Meeting summary",
                 visible=False,
-                elem_id="final-summary",  # matched by COPY_SUMMARY_JS
+                elem_id="final-summary",
+            )
+
+            # Hidden Textbox that mirrors the markdown source. COPY_SUMMARY_JS
+            # reads this element's <textarea>.value at click time (NOT
+            # final_summary_md's innerText, which strips markdown syntax
+            # from rendered output). M6.5 S1 fix.
+            #
+            # visible="hidden" (STRING literal, not False) is load-bearing:
+            # per gradio/components/textbox.py docstring, "If False, component
+            # will be hidden. If 'hidden', component will be visually hidden
+            # and not take up space in the layout BUT STILL EXIST IN THE DOM."
+            # Our first M6.5 pass used visible=False and the clipboard never
+            # updated (JS `querySelector('textarea')` returned null), so the
+            # OS clipboard kept whatever was there before the click. Do not
+            # flip this to False or to True anywhere in the session — value
+            # updates only. interactive=True ensures Gradio renders a real
+            # <textarea> element (interactive=False can render a read-only
+            # display element in some builds).
+            final_summary_source = gr.Textbox(
+                value="",
+                visible="hidden",
+                elem_id="final-summary-source",
+                interactive=True,
+                show_label=False,
             )
 
             with gr.Row():
@@ -922,12 +998,6 @@ def build_demo() -> gr.Blocks:
                     visible=False,
                     elem_id="download-btn",
                 )
-
-        gr.Markdown(
-            "<sub>Each tab runs independently — multiple tabs = multiple "
-            "queue slots. Tab close ejects any models this session loaded "
-            "and removes its temp files.</sub>"
-        )
 
         # ── Event wiring ──────────────────────────────────────────────────
 
@@ -980,6 +1050,7 @@ def build_demo() -> gr.Blocks:
                 meta_md,
                 run_status,
                 final_summary_md,
+                final_summary_source,
                 copy_btn,
                 download_btn,
             ],
@@ -999,6 +1070,7 @@ def build_demo() -> gr.Blocks:
             outputs=[
                 run_status,
                 final_summary_md,
+                final_summary_source,
                 copy_btn,
                 download_btn,
                 run_btn,
@@ -1017,6 +1089,7 @@ def build_demo() -> gr.Blocks:
             outputs=[
                 run_status,
                 final_summary_md,
+                final_summary_source,
                 copy_btn,
                 download_btn,
                 run_btn,
@@ -1026,8 +1099,9 @@ def build_demo() -> gr.Blocks:
             cancels=[run_event],
         )
 
-        # Copy button is pure JS — reads the rendered summary's innerText
-        # from the DOM and writes it to the clipboard. No Python round-trip.
+        # Copy button is pure JS — reads the raw markdown source from the
+        # hidden final_summary_source Textbox's textarea and writes to the
+        # clipboard. No Python round-trip, no innerText stripping. (S1)
         copy_btn.click(
             None,
             inputs=None,
