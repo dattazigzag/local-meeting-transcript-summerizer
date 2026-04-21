@@ -2,8 +2,8 @@
 
 ## Description
 
-> [!Warning]
-A multi-agent, privacy-first pipeline that transforms raw `.rtf` meeting transcripts from [Moonshine.ai](https://note-taker.moonshine.ai/) (CURRENTLY only for moonshine. Our transcriber's transcript handling is planned. _See at the bottom_) into polished, corporate-grade meeting minutes using local LLMs (like Gemma4 and Qwen) via Ollama.
+> [!Note]
+A multi-agent, privacy-first pipeline that transforms raw meeting transcripts into polished, corporate-grade meeting minutes using local LLMs (like Gemma4 and Qwen) via Ollama. Accepts `.rtf` exports from [Moonshine.ai](https://note-taker.moonshine.ai/) **and** `.md` exports from our local transcriber — the ingest step auto-detects the format and normalizes both into the same canonical shape before the LLM agents run.
 
 ## Overview
 
@@ -54,11 +54,11 @@ During the development of this pipeline, several critical discoveries shaped the
 ```mermaid
 graph TD
     subgraph Input
-        RTF[Raw .rtf Transcript]
+        SRC[Raw Transcript<br/>.rtf or .md]
     end
 
     subgraph "Master Orchestrator (main.py)"
-        S1[Step 1: Parse RTF<br/><i>step1_convert.py</i>]
+        S1[Step 1: Ingest & Normalize<br/><i>step1_convert.py</i>]
         S2[Step 2: Cleanup<br/><i>step2_cleanup.py</i>]
         S3[Step 3: Speaker Mapping<br/><i>step3_mapping.py</i>]
         S4[Step 4: Extraction<br/><i>step4_extraction.py</i>]
@@ -76,7 +76,7 @@ graph TD
     end
 
     %% Flow Execution
-    RTF --> S1
+    SRC --> S1
     S1 -- "Raw MD" --> S2
     S2 -- "Cleaned MD" --> S3
     S3 -- "Named MD" --> S4
@@ -98,16 +98,25 @@ graph TD
     classDef infra fill:#0984e3,stroke:#000,stroke-width:1px,color:#fff;
     
     class S1,S2,S3,S4,S5,VRAM script;
-    class RTF,FINAL input;
+    class SRC,FINAL input;
     class OLLAMA infra;
 ```
 
-### Step 1: Parse RTF to Markdown (Non-LLM)
+### Step 1: Ingest & Normalize Transcript (Non-LLM)
 
-Strips noisy .rtf formatting and groups consecutive speech into clean Markdown and JSON (_not used in further processing currently_).
+Dispatches by file suffix:
+
+- `.rtf` → strips Moonshine's RTF formatting and groups consecutive speech.
+- `.md` → parses our local transcriber's H3-heading format (with per-turn timestamps and language tags), or passes through an already-canonical markdown file unchanged.
+
+Both paths emit the same canonical Markdown (`**Speaker N:** text`) plus a JSON sidecar with turn stats (_not used in further processing currently_). See [`contexts/multi_format_ingest.md`](contexts/multi_format_ingest.md) for the full spec and design decisions.
 
 ```bash
-uv run step1_convert.py transcripts/<MeetingTranscript>.rtf --out-dir output/raw_files/
+# Moonshine input (.rtf)
+uv run python -m pipeline.step1_convert transcripts/<MeetingTranscript>.rtf --out-dir output/raw_files/
+
+# Our local transcriber's input (.md)
+uv run python -m pipeline.step1_convert transcripts/<MeetingTranscript>.md --out-dir output/raw_files/
 ```
 
 ### Step 2: Agent 1 - Transcript Cleanup
@@ -166,9 +175,11 @@ Because every step in this pipeline is modular, you do not need to run the indiv
 It will automatically build the output directories, process the transcript, pause to ask you for speaker names, and then generate the final summary.
 
 ```bash
-# Run the full pipeline with default models
+# Run the full pipeline with default models (on a Moonshine RTF)
 uv run main.py transcripts/MeetingTranscript.rtf
 
+# Or on our local transcriber's markdown export
+uv run main.py transcripts/MeetingTranscript.md
 
 # Run the full pipeline using the Mix-and-Match model strategy
 uv run main.py transcripts/MeetingTranscript.rtf \
@@ -247,10 +258,10 @@ uv run step2_cleanup.py input.md --host http://<your_ollama_host_ADDR>:<your_oll
 
 ## ToDo
 
-- [ ] Core Business logic extensions (to be able to account for our transcribers output too)
-  - [ ] Can it take a .md at first, skipping first step of conversion (by auto detecting .rtf or other formats vs .md)?
-  - [ ] How can we account for our transcriber’s diarization pattern (export would be .md - requiring cleanup) and moonshine’s pattern of .rtf, with diff diarization pattern. 
-  - [ ] Can it parse based on speaker ID as well as name, so the human in the loop step won't be necessary as our transcriber can already do speaker renaming and mapping 
+- [x] Core Business logic extensions — multi-format ingest support
+  - [x] Auto-detect `.rtf` vs `.md` at step 1; skip RTF conversion when input is already markdown.
+  - [x] Transcriber's H3-heading diarization pattern normalized into the same canonical `**Speaker N:**` shape as Moonshine.
+  - [x] Speaker IDs and real names both parsed; if the transcriber has already renamed speakers, step 3's human-in-the-loop pass becomes a no-op automatically.
 - [ ] g-radio implementation (for mcp and api support out of box)
 - [ ] deploy in docker
 - [ ] test with tool calling features  
