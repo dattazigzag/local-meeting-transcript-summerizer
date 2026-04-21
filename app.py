@@ -10,19 +10,24 @@ Run:
 
 Then open http://localhost:7860 in a browser.
 
-Status: M5 — Full pipeline run with progress + final output.
-Sidebar settings (M3), upload + ingest + preview + speaker form (M4) all
-unchanged. Run button now wired to ``run_pipeline_generator`` which streams
-steps 2→5 end-to-end. On completion a rendered summary + Copy button +
-Download button appear. On error or exception the button re-enables and an
-inline error surfaces. Model unload happens in a finally block; full
-cancellation handling comes in M6.
+Status: M6 — Cancellation + unload + session hooks.
+All of M3–M5 plus: a Stop button visible during runs that cancels the
+in-flight generator; a ``cleanup_session`` hook attached to ``gr.State``'s
+``delete_callback`` that fires when Gradio GCs a session (~60 min after
+a tab closes, per Gradio 6's session-GC window), ejecting that session's
+models and removing its tempdir; process-level ``atexit`` + SIGTERM
+handlers that walk the module-level set of every ``(host, model)``
+touched during the process lifetime and unload them on shutdown.
+Non-streaming Ollama calls mean cancellation mid-step waits for the
+current step to return before models eject — accepted per spec F3.
 """
 
 from __future__ import annotations
 
+import atexit
 import os
 import shutil
+import signal
 import sys
 import tempfile
 from pathlib import Path
@@ -67,6 +72,16 @@ OLLAMA_PROBE_TIMEOUT = 3.0
 UPLOAD_MAX_SIZE = "10mb"
 
 
+# ─── Process-level tracking for shutdown hooks ────────────────────────────
+
+# Every (host, model) pair ever touched by any session during this process's
+# lifetime. Populated inside ``run_pipeline_generator``. Walked by the atexit
+# and SIGTERM handlers to guarantee models are ejected on normal shutdown
+# and `docker stop` (SIGTERM). Not bulletproof against `kill -9` — see spec
+# risks table.
+_ALL_MODELS_EVER_LOADED: set[tuple[str, str]] = set()
+
+
 # ─── Dark-mode forcing ────────────────────────────────────────────────────
 # Gradio 6 respects the `?__theme=dark` URL param, but sending the user to
 # the raw URL is awkward. Injecting a one-line JS snippet on page load adds
@@ -83,6 +98,9 @@ FORCE_DARK_MODE_JS = """
 # puts it on the clipboard. Uses innerText (not innerHTML) so the user gets
 # clean, human-readable text rather than HTML tags. The elem_id here MUST
 # match the gr.Markdown elem_id below (``final-summary``).
+#
+# Note: M6.5 S1 deferred UX item — this currently strips markdown syntax.
+# A hidden Textbox mirror will be added in M6.5.
 COPY_SUMMARY_JS = """
 () => {
     const el = document.getElementById('final-summary');
@@ -148,7 +166,7 @@ def unload_model(host: str, model: str) -> None:
     """Send ``keep_alive=0`` to Ollama to evict a model.
 
     Best-effort: swallows all exceptions. Called from the pipeline's
-    finally block and (in M6) from session-cleanup paths.
+    finally block, the session-cleanup hook, and the process-exit handlers.
     """
     if not host or not model:
         return
@@ -181,6 +199,57 @@ def preflight_check(
     return True, "✓ Ready"
 
 
+# ─── Process-level shutdown handlers ─────────────────────────────────────
+
+def _global_cleanup_loaded_models() -> None:
+    """Walk the module-level set and unload every (host, model) pair.
+
+    Invoked by ``atexit`` on normal interpreter exit and by the SIGTERM
+    handler below. Idempotent — calling ``unload_model`` on an already-
+    ejected model is a harmless HTTP roundtrip that Ollama no-ops.
+    """
+    for host, model in list(_ALL_MODELS_EVER_LOADED):
+        unload_model(host, model)
+
+
+def _sigterm_handler(signum: int, frame: Any) -> None:
+    """SIGTERM → eject tracked models, then let the default exit path run.
+
+    Docker's ``docker stop`` sends SIGTERM then waits ~10s before SIGKILL,
+    so we have time to best-effort unload everything loaded on ziggie by
+    this process's sessions before the container dies.
+
+    NOTE: We do NOT install a SIGINT (Ctrl-C) handler. Gradio installs its
+    own for graceful dev-loop shutdown; overriding it breaks the dev UX.
+    ``atexit`` covers the Ctrl-C path regardless — SIGINT raises
+    KeyboardInterrupt, interpreter exits, ``atexit`` fires.
+    """
+    _global_cleanup_loaded_models()
+    # Re-raise with the default disposition so Gradio/uvicorn can tear down
+    # their sockets cleanly.
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def _install_process_hooks() -> None:
+    """Wire ``atexit`` + SIGTERM. Called once from ``main()``.
+
+    Signal handlers must be installed from the main thread; calling this
+    inside ``main()`` (before ``demo.launch()``) satisfies that.
+    """
+    atexit.register(_global_cleanup_loaded_models)
+    try:
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+    except (ValueError, OSError):
+        # Non-main-thread invocation (shouldn't happen from main()) or a
+        # platform that doesn't support this signal — log and continue.
+        print(
+            "Warning: could not install SIGTERM handler; "
+            "model cleanup on container stop will be best-effort.",
+            file=sys.stderr,
+        )
+
+
 # ─── Session state factory ───────────────────────────────────────────────
 
 def init_session_state() -> dict[str, Any]:
@@ -192,14 +261,14 @@ def init_session_state() -> dict[str, Any]:
          'canonical_md':        str | None,  # path to step1 output
          'uploaded_stem':       str | None,  # original filename stem
          'final_summary_path':  str | None,  # path to the step5 output
-         'models_used':         set[str],    # eject these on finally / M6 cleanup
+         'models_used':         set[str],    # eject on finally / tab close
          'ollama_host':         str,
          'run_in_progress':     bool}
 
     ``tempdir_path`` uses ``tempfile.mkdtemp()`` (string path) rather than a
     ``TemporaryDirectory`` object — the object carries a finalizer that
     doesn't play well with gr.State deepcopy semantics. Cleanup is explicit
-    in M6 via ``shutil.rmtree(ignore_errors=True)``.
+    via ``shutil.rmtree(ignore_errors=True)`` in ``cleanup_session``.
 
     Passed as ``gr.State(init_session_state())`` — the call produces a
     dict which Gradio then deepcopies per session. (Passing the callable
@@ -223,6 +292,52 @@ def _ensure_tempdir(state_val: dict[str, Any]) -> Path:
     if not state_val.get("tempdir_path"):
         state_val["tempdir_path"] = tempfile.mkdtemp(prefix="meeting_summarizer_")
     return Path(state_val["tempdir_path"])
+
+
+def cleanup_session(state_val: dict[str, Any] | None = None) -> None:
+    """Per-session cleanup. Fired by ``gr.State``'s ``delete_callback``.
+
+    Gradio 6 deletes a session's ``gr.State`` ~60 minutes after the user's
+    browser disconnects (configurable via ``delete_cache`` but 60 min is
+    the default). When that deletion happens, ``delete_callback`` is
+    invoked with the state value.
+
+    Ejects the session's touched models and removes its tempdir. Best-
+    effort: all exceptions swallowed so a cleanup error can never crash
+    the server process.
+
+    The ``state_val: ... | None = None`` signature exists for a specific
+    reason: Gradio 6's internal signature-validator for ``delete_callback``
+    treats the callback as an event listener with an empty inputs list,
+    producing a spurious ``UserWarning: Expected 1 arguments ... received
+    0`` at app startup when the function declares one required arg. Making
+    the arg optional silences that warning at check time while the actual
+    invocation at delete time (Gradio's docs are clear that the callback
+    receives the state value) still reaches the full cleanup path. If for
+    some reason Gradio ever does call us with no args, the ``isinstance``
+    guard below makes this a safe no-op and the ``atexit``/SIGTERM hooks
+    still cover shutdown.
+
+    The 60-min delay means idle models may stay loaded on ziggie after a
+    tab closes. Two other cleanup paths cover the real-time cases:
+      * The pipeline generator's ``finally`` block ejects models at
+        end-of-run (success, error, or Stop).
+      * The process-level ``atexit`` + SIGTERM handlers walk
+        ``_ALL_MODELS_EVER_LOADED`` on shutdown.
+
+    Previously attached to ``demo.unload`` — but Gradio 6's unload doesn't
+    inject ``gr.State`` into the callback (it passes zero args). Switched
+    to ``delete_callback`` on ``gr.State`` itself, which is the documented
+    pattern for per-session cleanup that gets the state dict directly.
+    """
+    if not isinstance(state_val, dict):
+        return
+    host = state_val.get("ollama_host", "")
+    for model in list(state_val.get("models_used", ())):
+        unload_model(host, model)
+    tempdir_path = state_val.get("tempdir_path")
+    if tempdir_path:
+        shutil.rmtree(tempdir_path, ignore_errors=True)
 
 
 # ─── UI event handlers ───────────────────────────────────────────────────
@@ -294,6 +409,32 @@ def on_test_connection(host: str) -> tuple[str, dict]:
             "Update the host in the sidebar and click **Test connection**."
         ),
         visible=True,
+    )
+
+
+def on_stop(state_val: dict[str, Any]) -> tuple:
+    """Stop-button click handler.
+
+    Returns a 7-tuple matching the Run button's output layout. Re-enables
+    Run, hides Stop, and writes a cancellation status line. The actual
+    cancellation of the in-flight generator is done by Gradio's
+    ``cancels=[run_event]`` wiring on the Stop button's .click. The
+    generator's ``finally`` block ejects models on GeneratorExit.
+
+    Note: due to the non-streaming Ollama calls (spec F3), clicking Stop
+    while a step is mid-call will not interrupt the HTTP request. The
+    generator cancels when the current step returns, which can be 1–3
+    minutes on big models. The UI returns to idle immediately; the backend
+    finishes catching up behind the scenes.
+    """
+    return (
+        gr.update(value="⏸ Cancelled by user.", visible=True),   # run_status
+        gr.update(visible=False),                                # final_summary_md
+        gr.update(visible=False),                                # copy_btn
+        gr.update(value=None, visible=False),                    # download_btn
+        gr.update(interactive=True),                             # run_btn
+        state_val,                                               # session_state
+        gr.update(visible=False),                                # stop_btn
     )
 
 
@@ -426,17 +567,22 @@ def run_pipeline_generator(
 ) -> Iterator[tuple]:
     """Run steps 2 → 5 on the session's ingested transcript.
 
-    Generator: yields a 6-tuple at each phase boundary matching the Run
+    Generator: yields a 7-tuple at each phase boundary matching the Run
     button's outputs list (run_status, final_summary_md, copy_btn,
-    download_btn, run_btn, session_state).
+    download_btn, run_btn, session_state, stop_btn).
 
     On pre-flight failure, yields once with an error and stops — no
     try/finally entered, so no models are touched.
 
+    Inside the try/finally, every yield flips stop_btn visibility to True
+    so it's available throughout the run; the terminal (success, error,
+    and cancellation) paths flip it back to False.
+
     On any step raising (``SystemExit`` from the step modules' ``sys.exit(1)``
     paths, or any ``Exception``), yields an error and cleans up models in
-    ``finally``. ``KeyboardInterrupt`` and ``GeneratorExit`` are left to
-    propagate so the user / Gradio can cancel cleanly.
+    ``finally``. ``GeneratorExit`` (from Stop button's ``cancels=``) also
+    reaches ``finally``, ejecting models. ``KeyboardInterrupt`` propagates
+    so server-side Ctrl-C still works.
 
     Non-streaming Ollama calls mean cancellation during a step is blocked
     until the step returns — accepted trade-off per spec F3 / Risks.
@@ -453,6 +599,7 @@ def run_pipeline_generator(
             gr.update(visible=False),
             gr.update(interactive=True),
             state_val,
+            gr.update(visible=False),  # stop_btn: nothing to cancel
         )
         return
 
@@ -465,6 +612,7 @@ def run_pipeline_generator(
             gr.update(visible=False),
             gr.update(interactive=True),
             state_val,
+            gr.update(visible=False),
         )
         return
 
@@ -475,23 +623,26 @@ def run_pipeline_generator(
     # a step raises before touching Ollama. ``unload_model`` is best-effort,
     # so extra calls on non-loaded models are harmless.
     state_val["models_used"].update({editor_model, extractor_model})
+    # Module-level tracking for SIGTERM / atexit cleanup.
+    _ALL_MODELS_EVER_LOADED.add((ollama_host, editor_model))
+    _ALL_MODELS_EVER_LOADED.add((ollama_host, extractor_model))
     state_val["run_in_progress"] = True
 
-    # Stable yields for "no change on this output" — keeps the 6-tuple shape
+    # Stable yields for "no change on this output" — keeps the 7-tuple shape
     # consistent without re-clobbering fields we don't want to touch.
     NOOP_FINAL = gr.update()
     NOOP_COPY = gr.update()
     NOOP_DOWNLOAD = gr.update()
 
     try:
-        # Run button disabled during the run; re-enabled in finally via the
-        # terminal yields (success or error).
+        # Run button disabled during the run; Stop button revealed.
         progress(0.0, desc="Cleaning transcript…")
         yield (
             gr.update(value="**Step 1/4** · Cleaning transcript…", visible=True),
             NOOP_FINAL, NOOP_COPY, NOOP_DOWNLOAD,
             gr.update(interactive=False),
             state_val,
+            gr.update(visible=True),  # stop_btn visible throughout the run
         )
         cleaned_path = clean_transcript(
             canonical_md_path,
@@ -507,6 +658,7 @@ def run_pipeline_generator(
             NOOP_FINAL, NOOP_COPY, NOOP_DOWNLOAD,
             gr.update(interactive=False),
             state_val,
+            gr.update(visible=True),
         )
         cleaned_text = cleaned_path.read_text(encoding="utf-8")
         named_text = apply_speaker_mapping(cleaned_text, speaker_map or {})
@@ -524,6 +676,7 @@ def run_pipeline_generator(
             NOOP_FINAL, NOOP_COPY, NOOP_DOWNLOAD,
             gr.update(interactive=False),
             state_val,
+            gr.update(visible=True),
         )
         extracted_path = extract_information(
             named_path,
@@ -538,6 +691,7 @@ def run_pipeline_generator(
             NOOP_FINAL, NOOP_COPY, NOOP_DOWNLOAD,
             gr.update(interactive=False),
             state_val,
+            gr.update(visible=True),
         )
         final_path = format_summary(
             extracted_path,
@@ -567,11 +721,13 @@ def run_pipeline_generator(
             gr.update(value=str(download_path), visible=True),
             gr.update(interactive=True),
             state_val,
+            gr.update(visible=False),  # stop_btn hidden on success
         )
 
     except (Exception, SystemExit) as e:
-        # Excludes KeyboardInterrupt and GeneratorExit — those must propagate
-        # so cancellation works cleanly (M6 wires it up in detail).
+        # Excludes KeyboardInterrupt and GeneratorExit — GeneratorExit is
+        # how gr.cancels reaches us; we let it propagate so Gradio handles
+        # the cancellation bookkeeping, and the finally block still runs.
         err_type = type(e).__name__
         err_msg = str(e) or err_type
         yield (
@@ -584,12 +740,14 @@ def run_pipeline_generator(
             gr.update(visible=False),
             gr.update(interactive=True),
             state_val,
+            gr.update(visible=False),  # stop_btn hidden on error
         )
 
     finally:
         # Eject models regardless of outcome. Important on success too —
         # without this, ``keep_alive=-1`` from inside the step functions
         # leaves both models hot on ziggie until another run or timeout.
+        # Also fires on Stop (GeneratorExit) and Exception paths.
         state_val["run_in_progress"] = False
         for m in list(state_val.get("models_used", ())):
             unload_model(ollama_host, m)
@@ -604,7 +762,14 @@ def build_demo() -> gr.Blocks:
         # produce the initial dict; Gradio deepcopies it per session so each
         # browser tab gets its own independent copy. Do NOT pass the bare
         # callable — see ``init_session_state`` docstring for why.
-        session_state = gr.State(init_session_state())
+        #
+        # ``delete_callback`` is invoked with the state dict when Gradio
+        # GCs the session (~60 min after tab close). See ``cleanup_session``
+        # for why this API was chosen over ``demo.unload``.
+        session_state = gr.State(
+            value=init_session_state(),
+            delete_callback=cleanup_session,
+        )
 
         # Drives the @gr.render-decorated speaker form. List of 'Speaker N'
         # tags detected in the latest upload; empty list = no form shown.
@@ -716,12 +881,21 @@ def build_demo() -> gr.Blocks:
                         outputs=[speaker_map_state],
                     )
 
-            run_btn = gr.Button(
-                "Run",
-                variant="primary",
-                interactive=False,
-                elem_id="run-btn",
-            )
+            # Run + Stop share a row. Stop sits next to Run (hidden until
+            # a run is active). M6.5 UX pass will likely reshuffle this.
+            with gr.Row():
+                run_btn = gr.Button(
+                    "Run",
+                    variant="primary",
+                    interactive=False,
+                    elem_id="run-btn",
+                )
+                stop_btn = gr.Button(
+                    "Stop",
+                    variant="stop",
+                    visible=False,
+                    elem_id="stop-btn",
+                )
 
             # ── Run-time output section ─────────────────────────────────
             # All hidden until the pipeline makes progress. Status ticks
@@ -751,7 +925,8 @@ def build_demo() -> gr.Blocks:
 
         gr.Markdown(
             "<sub>Each tab runs independently — multiple tabs = multiple "
-            "queue slots. Tab close ejects any models this session loaded.</sub>"
+            "queue slots. Tab close ejects any models this session loaded "
+            "and removes its temp files.</sub>"
         )
 
         # ── Event wiring ──────────────────────────────────────────────────
@@ -810,8 +985,9 @@ def build_demo() -> gr.Blocks:
             ],
         )
 
-        # Run button → streams through steps 2–5.
-        run_btn.click(
+        # Run button → streams through steps 2–5. Captured into a variable
+        # so the Stop button can ``cancels=[run_event]`` it.
+        run_event = run_btn.click(
             run_pipeline_generator,
             inputs=[
                 session_state,
@@ -827,7 +1003,27 @@ def build_demo() -> gr.Blocks:
                 download_btn,
                 run_btn,
                 session_state,
+                stop_btn,
             ],
+        )
+
+        # Stop button: cancels the in-flight generator AND resets the UI.
+        # Due to non-streaming Ollama (spec F3), the actual model unload
+        # waits for the current step to return; UI returns to idle
+        # immediately so the user isn't confused.
+        stop_btn.click(
+            on_stop,
+            inputs=[session_state],
+            outputs=[
+                run_status,
+                final_summary_md,
+                copy_btn,
+                download_btn,
+                run_btn,
+                session_state,
+                stop_btn,
+            ],
+            cancels=[run_event],
         )
 
         # Copy button is pure JS — reads the rendered summary's innerText
@@ -855,6 +1051,11 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # Install atexit + SIGTERM before the server starts accepting requests.
+    # Main-thread only; both handlers walk `_ALL_MODELS_EVER_LOADED`.
+    _install_process_hooks()
+
     demo = build_demo()
     demo.launch(
         server_name=SERVER_HOST,
