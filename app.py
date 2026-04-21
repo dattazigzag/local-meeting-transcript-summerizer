@@ -155,21 +155,39 @@ CUSTOM_CSS = """
 }
 
 /* Progress bar contrast (gr.Label).
-   Target the component's outer box and any inner bar-like elements. */
+   gr.Label renders each confidence row as a native <meter class="bar">
+   element. To restyle it we need appearance:none + the WebKit/Moz meter
+   pseudo-elements; plain class selectors don't reach the fill. */
 #progress-label {
     background: var(--neutral-900, #0f0f0f) !important;
     padding: 10px 14px !important;
     border-radius: 6px !important;
     border: 1px solid var(--border-color-primary, rgba(255, 255, 255, 0.08)) !important;
 }
-#progress-label [class*="confidence"] {
-    background: transparent !important;
+#progress-label meter {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 10px;
+    border: none;
+    border-radius: 5px;
+    background: rgba(255, 255, 255, 0.08);
 }
-#progress-label [class*="fill"],
-#progress-label .confidence-set > div > div,
-#progress-label [data-testid="confidence-fill"] {
-    background: var(--color-accent, #10b981) !important;
-    filter: saturate(1.4) brightness(1.1);
+#progress-label meter::-webkit-meter-bar {
+    background: rgba(255, 255, 255, 0.08);
+    border: none;
+    border-radius: 5px;
+}
+#progress-label meter::-webkit-meter-optimum-value,
+#progress-label meter::-webkit-meter-suboptimum-value,
+#progress-label meter::-webkit-meter-even-less-good-value {
+    background: #11ba88;
+    border-radius: 5px;
+    transition: width 0.25s ease;
+}
+#progress-label meter::-moz-meter-bar {
+    background: #11ba88;
+    border-radius: 5px;
 }
 
 /* Rendered/Raw toggle — display controlled by a class on the outer column
