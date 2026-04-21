@@ -10,12 +10,13 @@ Run:
 
 Then open http://localhost:7860 in a browser.
 
-Status: M4 — Upload → ingest → preview → speaker form.
-Sidebar settings from M3 remain. File upload accepts .rtf / .md, runs
-step1_convert into a per-session tempdir, renders canonical markdown inline,
-and conditionally shows one text field per generic 'Speaker N' tag via
-@gr.render. Run button is rendered but not wired — M5 adds the pipeline
-execution.
+Status: M5 — Full pipeline run with progress + final output.
+Sidebar settings (M3), upload + ingest + preview + speaker form (M4) all
+unchanged. Run button now wired to ``run_pipeline_generator`` which streams
+steps 2→5 end-to-end. On completion a rendered summary + Copy button +
+Download button appear. On error or exception the button re-enables and an
+inline error surfaces. Model unload happens in a finally block; full
+cancellation handling comes in M6.
 """
 
 from __future__ import annotations
@@ -25,14 +26,17 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import gradio as gr
 import httpx
 from dotenv import load_dotenv
 
 from pipeline.step1_convert import convert
-from pipeline.step3_mapping import detect_generic_speakers
+from pipeline.step2_cleanup import clean_transcript
+from pipeline.step3_mapping import apply_speaker_mapping, detect_generic_speakers
+from pipeline.step4_extraction import extract_information
+from pipeline.step5_formatter import format_summary
 
 
 # Load .env at module import so OLLAMA_HOST (and any other env-driven
@@ -54,7 +58,8 @@ SERVER_PORT = 7860
 SERVER_HOST = "0.0.0.0"  # reachable on LAN / inside Docker; revisit at M9
 
 # HTTP timeout for Ollama probes. Short because these are reachability checks,
-# not model-generation calls (which happen in M5 with their own timeouts).
+# not model-generation calls (which happen inside the step functions with
+# their own implicit timeouts via ollama.Client).
 OLLAMA_PROBE_TIMEOUT = 3.0
 
 # Upload cap. Enforced at demo.launch(max_file_size=...); gr.File itself has
@@ -71,6 +76,22 @@ FORCE_DARK_MODE_JS = """
     if (!document.body.classList.contains('dark')) {
         document.body.classList.add('dark');
     }
+}
+"""
+
+# JS fired by the Copy button. Reads the rendered summary's innerText and
+# puts it on the clipboard. Uses innerText (not innerHTML) so the user gets
+# clean, human-readable text rather than HTML tags. The elem_id here MUST
+# match the gr.Markdown elem_id below (``final-summary``).
+COPY_SUMMARY_JS = """
+() => {
+    const el = document.getElementById('final-summary');
+    if (!el) {
+        console.warn('final-summary element not found');
+        return;
+    }
+    const text = el.innerText || '';
+    navigator.clipboard.writeText(text);
 }
 """
 
@@ -126,8 +147,8 @@ def validate_model_available(host: str, model: str) -> bool:
 def unload_model(host: str, model: str) -> None:
     """Send ``keep_alive=0`` to Ollama to evict a model.
 
-    Best-effort: swallows all exceptions. Called from M6 cancellation paths;
-    defined here in M3 so the full Ollama surface lives in one place.
+    Best-effort: swallows all exceptions. Called from the pipeline's
+    finally block and (in M6) from session-cleanup paths.
     """
     if not host or not model:
         return
@@ -145,7 +166,7 @@ def unload_model(host: str, model: str) -> None:
 def preflight_check(
     host: str, editor_model: str, extractor_model: str
 ) -> tuple[bool, str]:
-    """Gate function for Run (wired up in M5). Defined here as a stub.
+    """Gate function for Run.
 
     Verifies Ollama is reachable AND both required models are pulled.
     Returns (ready, user-facing message).
@@ -167,12 +188,13 @@ def init_session_state() -> dict[str, Any]:
 
     Shape::
 
-        {'tempdir_path':   str | None,  # mkdtemp'd on first upload
-         'canonical_md':   str | None,  # path to the step1 output for this session
-         'uploaded_stem':  str | None,  # original filename stem, for download naming in M5
-         'models_used':    set[str],    # populated in M5; used by M6 cleanup
-         'ollama_host':    str,
-         'run_in_progress': bool}
+        {'tempdir_path':        str | None,
+         'canonical_md':        str | None,  # path to step1 output
+         'uploaded_stem':       str | None,  # original filename stem
+         'final_summary_path':  str | None,  # path to the step5 output
+         'models_used':         set[str],    # eject these on finally / M6 cleanup
+         'ollama_host':         str,
+         'run_in_progress':     bool}
 
     ``tempdir_path`` uses ``tempfile.mkdtemp()`` (string path) rather than a
     ``TemporaryDirectory`` object — the object carries a finalizer that
@@ -189,6 +211,7 @@ def init_session_state() -> dict[str, Any]:
         "tempdir_path": None,
         "canonical_md": None,
         "uploaded_stem": None,
+        "final_summary_path": None,
         "models_used": set(),
         "ollama_host": DEFAULT_OLLAMA_HOST,
         "run_in_progress": False,
@@ -274,23 +297,37 @@ def on_test_connection(host: str) -> tuple[str, dict]:
     )
 
 
+# Empty updates for the four run-output components, used by on_file_upload
+# to clear stale results when a new file is uploaded or the upload is cleared.
+_RUN_OUTPUT_RESET = (
+    gr.update(value="", visible=False),   # run_status
+    gr.update(value="", visible=False),   # final_summary_md
+    gr.update(visible=False),             # copy_btn
+    gr.update(value=None, visible=False), # download_btn
+)
+
+
 def on_file_upload(
     uploaded_file: str | None,
     state_val: dict[str, Any],
-) -> tuple[dict, dict, dict, list[str], dict, dict, dict]:
+) -> tuple:
     """Handle file upload / clear.
 
     Runs step1_convert into the session tempdir, renders preview, detects
     generic speakers, enables Run if ingest succeeded.
 
-    Returns a 7-tuple in this order to match the event listener's outputs:
+    Returns an 11-tuple in this order to match the event listener's outputs:
         preview_md update,
         error_md update,
         run_btn update,
         detected_speakers_state,
         speaker_map_state (always reset to {} on new upload),
         session_state,
-        meta_md update  (small "Detected N turns, M speakers" line)
+        meta_md update,
+        run_status update,          (reset — stale after new upload)
+        final_summary_md update,    (reset)
+        copy_btn update,            (reset)
+        download_btn update         (reset)
 
     Any exception from step1 — including ``SystemExit`` raised on format-
     detection failures — is caught explicitly. A bare ``except Exception``
@@ -301,6 +338,7 @@ def on_file_upload(
     if uploaded_file is None:
         state_val["canonical_md"] = None
         state_val["uploaded_stem"] = None
+        state_val["final_summary_path"] = None
         return (
             gr.update(value="", visible=False),   # preview
             gr.update(value="", visible=False),   # error
@@ -309,6 +347,7 @@ def on_file_upload(
             {},                                   # speaker_map_state
             state_val,                            # session_state
             gr.update(value="", visible=False),   # meta line
+            *_RUN_OUTPUT_RESET,                   # clear stale run results
         )
 
     src = Path(uploaded_file)
@@ -329,6 +368,7 @@ def on_file_upload(
         err_msg = str(e) or err_type
         state_val["canonical_md"] = None
         state_val["uploaded_stem"] = None
+        state_val["final_summary_path"] = None
         return (
             gr.update(value="", visible=False),
             gr.update(
@@ -340,11 +380,13 @@ def on_file_upload(
             {},
             state_val,
             gr.update(value="", visible=False),
+            *_RUN_OUTPUT_RESET,
         )
 
     canonical_md = md_path.read_text(encoding="utf-8")
     state_val["canonical_md"] = str(md_path)
     state_val["uploaded_stem"] = src.stem
+    state_val["final_summary_path"] = None  # prior runs' output is now stale
 
     speakers = detect_generic_speakers(canonical_md)
     # Line count excluding headings/blanks gives a rough turn count for the
@@ -368,7 +410,189 @@ def on_file_upload(
         {},  # reset speaker_map for the new upload
         state_val,
         gr.update(value=f"<sub>{meta_line}</sub>", visible=True),
+        *_RUN_OUTPUT_RESET,
     )
+
+
+# ─── Pipeline orchestration ──────────────────────────────────────────────
+
+def run_pipeline_generator(
+    state_val: dict[str, Any],
+    editor_model: str,
+    extractor_model: str,
+    ollama_host: str,
+    speaker_map: dict[str, str],
+    progress: gr.Progress = gr.Progress(),
+) -> Iterator[tuple]:
+    """Run steps 2 → 5 on the session's ingested transcript.
+
+    Generator: yields a 6-tuple at each phase boundary matching the Run
+    button's outputs list (run_status, final_summary_md, copy_btn,
+    download_btn, run_btn, session_state).
+
+    On pre-flight failure, yields once with an error and stops — no
+    try/finally entered, so no models are touched.
+
+    On any step raising (``SystemExit`` from the step modules' ``sys.exit(1)``
+    paths, or any ``Exception``), yields an error and cleans up models in
+    ``finally``. ``KeyboardInterrupt`` and ``GeneratorExit`` are left to
+    propagate so the user / Gradio can cancel cleanly.
+
+    Non-streaming Ollama calls mean cancellation during a step is blocked
+    until the step returns — accepted trade-off per spec F3 / Risks.
+    """
+    # ── Pre-flight ────────────────────────────────────────────────────────
+    if not state_val.get("canonical_md"):
+        yield (
+            gr.update(
+                value="❌ No transcript ingested. Upload a file first.",
+                visible=True,
+            ),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(interactive=True),
+            state_val,
+        )
+        return
+
+    ok, msg = preflight_check(ollama_host, editor_model, extractor_model)
+    if not ok:
+        yield (
+            gr.update(value=f"❌ Pre-flight failed: {msg}", visible=True),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(interactive=True),
+            state_val,
+        )
+        return
+
+    tempdir = Path(state_val["tempdir_path"])
+    canonical_md_path = Path(state_val["canonical_md"])
+
+    # Track both models eagerly so the finally block can eject them even if
+    # a step raises before touching Ollama. ``unload_model`` is best-effort,
+    # so extra calls on non-loaded models are harmless.
+    state_val["models_used"].update({editor_model, extractor_model})
+    state_val["run_in_progress"] = True
+
+    # Stable yields for "no change on this output" — keeps the 6-tuple shape
+    # consistent without re-clobbering fields we don't want to touch.
+    NOOP_FINAL = gr.update()
+    NOOP_COPY = gr.update()
+    NOOP_DOWNLOAD = gr.update()
+
+    try:
+        # Run button disabled during the run; re-enabled in finally via the
+        # terminal yields (success or error).
+        progress(0.0, desc="Cleaning transcript…")
+        yield (
+            gr.update(value="**Step 1/4** · Cleaning transcript…", visible=True),
+            NOOP_FINAL, NOOP_COPY, NOOP_DOWNLOAD,
+            gr.update(interactive=False),
+            state_val,
+        )
+        cleaned_path = clean_transcript(
+            canonical_md_path,
+            tempdir / "cleaned",
+            editor_model,
+            ollama_host,
+        )
+
+        # Step 3: pure, in-memory speaker mapping. No Ollama call.
+        progress(0.25, desc="Applying speaker names…")
+        yield (
+            gr.update(value="**Step 2/4** · Applying speaker names…", visible=True),
+            NOOP_FINAL, NOOP_COPY, NOOP_DOWNLOAD,
+            gr.update(interactive=False),
+            state_val,
+        )
+        cleaned_text = cleaned_path.read_text(encoding="utf-8")
+        named_text = apply_speaker_mapping(cleaned_text, speaker_map or {})
+        named_dir = tempdir / "named"
+        named_dir.mkdir(parents=True, exist_ok=True)
+        # Mirror the CLI's stem convention so step4's strip of "_named" works
+        # out to the original uploaded_stem.
+        named_stem = cleaned_path.stem.replace("_cleaned", "_named")
+        named_path = named_dir / f"{named_stem}.md"
+        named_path.write_text(named_text, encoding="utf-8")
+
+        progress(0.50, desc="Extracting information…")
+        yield (
+            gr.update(value="**Step 3/4** · Extracting information…", visible=True),
+            NOOP_FINAL, NOOP_COPY, NOOP_DOWNLOAD,
+            gr.update(interactive=False),
+            state_val,
+        )
+        extracted_path = extract_information(
+            named_path,
+            tempdir / "extracted",
+            extractor_model,
+            ollama_host,
+        )
+
+        progress(0.75, desc="Formatting summary…")
+        yield (
+            gr.update(value="**Step 4/4** · Formatting final summary…", visible=True),
+            NOOP_FINAL, NOOP_COPY, NOOP_DOWNLOAD,
+            gr.update(interactive=False),
+            state_val,
+        )
+        final_path = format_summary(
+            extracted_path,
+            tempdir / "final",
+            editor_model,
+            ollama_host,
+        )
+
+        # Rename the summary file to something user-friendly for download,
+        # based on the original upload's stem. The internal file in /final
+        # lives alongside; we copy rather than rename so any intermediate
+        # debugging artifacts stay intact.
+        stem = state_val.get("uploaded_stem") or final_path.stem
+        download_dir = tempdir / "download"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        download_path = download_dir / f"{stem}_summary.md"
+        shutil.copy(final_path, download_path)
+        state_val["final_summary_path"] = str(download_path)
+
+        final_content = download_path.read_text(encoding="utf-8")
+
+        progress(1.0, desc="Done")
+        yield (
+            gr.update(value="✅ Summary ready.", visible=True),
+            gr.update(value=final_content, visible=True),
+            gr.update(visible=True),
+            gr.update(value=str(download_path), visible=True),
+            gr.update(interactive=True),
+            state_val,
+        )
+
+    except (Exception, SystemExit) as e:
+        # Excludes KeyboardInterrupt and GeneratorExit — those must propagate
+        # so cancellation works cleanly (M6 wires it up in detail).
+        err_type = type(e).__name__
+        err_msg = str(e) or err_type
+        yield (
+            gr.update(
+                value=f"❌ Pipeline failed at runtime: {err_type}: {err_msg}",
+                visible=True,
+            ),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(interactive=True),
+            state_val,
+        )
+
+    finally:
+        # Eject models regardless of outcome. Important on success too —
+        # without this, ``keep_alive=-1`` from inside the step functions
+        # leaves both models hot on ziggie until another run or timeout.
+        state_val["run_in_progress"] = False
+        for m in list(state_val.get("models_used", ())):
+            unload_model(ollama_host, m)
 
 
 # ─── UI construction ──────────────────────────────────────────────────────
@@ -387,7 +611,7 @@ def build_demo() -> gr.Blocks:
         detected_speakers_state = gr.State([])
 
         # Written by each speaker-name textbox on change. Read by the Run
-        # handler in M5 and passed to apply_speaker_mapping().
+        # handler and passed to apply_speaker_mapping().
         speaker_map_state = gr.State({})
 
         with gr.Sidebar():
@@ -445,8 +669,7 @@ def build_demo() -> gr.Blocks:
 
             # Canonical markdown preview. Scrollable. (No built-in copy
             # button on gr.Markdown in this Gradio version; users can still
-            # select-and-copy. The final summary in M5 gets a dedicated Copy
-            # button per spec D5.)
+            # select-and-copy. The final summary has a dedicated Copy button.)
             preview_md = gr.Markdown(
                 "",
                 label="Preview",
@@ -493,13 +716,38 @@ def build_demo() -> gr.Blocks:
                         outputs=[speaker_map_state],
                     )
 
-            # Run button — rendered but inert until M5 wires the pipeline.
             run_btn = gr.Button(
                 "Run",
                 variant="primary",
                 interactive=False,
                 elem_id="run-btn",
             )
+
+            # ── Run-time output section ─────────────────────────────────
+            # All hidden until the pipeline makes progress. Status ticks
+            # through the 4 phases; on success the rendered summary, Copy,
+            # and Download reveal together.
+            run_status = gr.Markdown("", visible=False, elem_id="run-status")
+
+            final_summary_md = gr.Markdown(
+                "",
+                label="Meeting summary",
+                visible=False,
+                elem_id="final-summary",  # matched by COPY_SUMMARY_JS
+            )
+
+            with gr.Row():
+                copy_btn = gr.Button(
+                    "Copy summary",
+                    variant="secondary",
+                    visible=False,
+                    elem_id="copy-btn",
+                )
+                download_btn = gr.DownloadButton(
+                    "Download .md",
+                    visible=False,
+                    elem_id="download-btn",
+                )
 
         gr.Markdown(
             "<sub>Each tab runs independently — multiple tabs = multiple "
@@ -543,6 +791,7 @@ def build_demo() -> gr.Blocks:
         )
 
         # File upload: ingest, render preview, detect speakers, enable Run.
+        # Also clears any stale run-result components from a previous run.
         upload.change(
             on_file_upload,
             inputs=[upload, session_state],
@@ -554,7 +803,40 @@ def build_demo() -> gr.Blocks:
                 speaker_map_state,
                 session_state,
                 meta_md,
+                run_status,
+                final_summary_md,
+                copy_btn,
+                download_btn,
             ],
+        )
+
+        # Run button → streams through steps 2–5.
+        run_btn.click(
+            run_pipeline_generator,
+            inputs=[
+                session_state,
+                editor_model,
+                extractor_model,
+                ollama_host,
+                speaker_map_state,
+            ],
+            outputs=[
+                run_status,
+                final_summary_md,
+                copy_btn,
+                download_btn,
+                run_btn,
+                session_state,
+            ],
+        )
+
+        # Copy button is pure JS — reads the rendered summary's innerText
+        # from the DOM and writes it to the clipboard. No Python round-trip.
+        copy_btn.click(
+            None,
+            inputs=None,
+            outputs=None,
+            js=COPY_SUMMARY_JS,
         )
 
     return demo
