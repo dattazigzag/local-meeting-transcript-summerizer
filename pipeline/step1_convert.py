@@ -137,15 +137,185 @@ def _ingest_moonshine_rtf(rtf_path: Path, out_dir: Path) -> tuple[Path, Path]:
 
 
 def _ingest_markdown(md_path: Path, out_dir: Path) -> tuple[Path, Path]:
-    """Parse our local transcriber's .md export into canonical markdown + JSON.
+    """Parse a .md transcript into canonical markdown + JSON.
 
-    Stubbed until M2. See contexts/multi_format_ingest.md.
+    Handles two shapes:
+      1. Our transcriber's H3-heading style (primary M2 target).
+      2. Already-canonical '**Speaker N:** text' style (re-ingest passthrough).
     """
-    raise NotImplementedError(
-        f"Markdown ingest not yet implemented (milestone M2). "
-        f"Received: {md_path}. "
-        f"For now, only .rtf inputs are supported."
-    )
+    content = md_path.read_text(encoding="utf-8")
+
+    if _looks_like_transcriber(content):
+        turns = _parse_transcriber_turns(content)
+    elif _looks_like_canonical(content):
+        turns = _parse_canonical_md_turns(content)
+    else:
+        raise SystemExit(
+            f"Could not detect transcript format in {md_path}. "
+            "Expected either transcriber-style '### SPEAKER_XX [...]' headings "
+            "or canonical '**Speaker N:**' inline tags."
+        )
+
+    if not turns:
+        raise SystemExit(
+            f"No speaker turns found in {md_path}. "
+            "File was detected as markdown but no parseable content was extracted."
+        )
+
+    return _write_outputs(turns, md_path.name, out_dir, md_path.stem)
+
+
+# ---------------------------------------------------------------------------
+# Markdown parsing helpers (transcriber format + canonical passthrough)
+# ---------------------------------------------------------------------------
+
+# Transcriber H3 heading shape:
+#   ### SPEAKER_02 [00:00 → 00:51] EN     (speaker ID form)
+#   ### Amanda [00:00 → 00:51] EN         (if transcriber already renamed)
+#   ### SPEAKER_01                        (bare, no timing/lang)
+TRANSCRIBER_H3_RE = re.compile(r"^###\s+(.+?)\s*$")
+
+# Canonical inline form (our step1 output; re-ingest case):
+#   **Speaker 1:** body text
+#   **Amanda:**   body text
+CANONICAL_INLINE_RE = re.compile(r"^\*\*([^*]+?):\*\*\s*(.*)$")
+
+# Speaker-ID shape: SPEAKER_00, SPEAKER_1, speaker 02, etc.
+SPEAKER_ID_RE = re.compile(r"^SPEAKER[_\s]?(\d+)$", re.IGNORECASE)
+
+
+def _extract_speaker_from_heading(body: str) -> str:
+    """Pull the speaker identifier from an H3 heading body.
+
+    Strips an optional [timestamp] block and an optional trailing 2-3 letter
+    uppercase language token.
+
+        'SPEAKER_02 [00:00 → 00:51] EN' -> 'SPEAKER_02'
+        'Mary Jane [01:00 → 02:00] EN'  -> 'Mary Jane'
+        'SPEAKER_01'                    -> 'SPEAKER_01'
+    """
+    without_bracket = re.sub(r"\s*\[[^\]]*\]\s*", " ", body).strip()
+    without_lang = re.sub(r"\s+[A-Z]{2,3}\s*$", "", without_bracket).strip()
+    return without_lang or without_bracket
+
+
+def _normalize_speaker_tag(raw: str) -> str:
+    """Apply D1 policy: SPEAKER_02 -> 'Speaker 2'; real names pass through.
+
+    Zero-padding is stripped (via int()), zero-indexing is preserved:
+        SPEAKER_00 -> 'Speaker 0'
+        SPEAKER_02 -> 'Speaker 2'
+        SPEAKER_12 -> 'Speaker 12'
+        Amanda     -> 'Amanda'
+    """
+    m = SPEAKER_ID_RE.match(raw)
+    if m:
+        return f"Speaker {int(m.group(1))}"
+    return raw
+
+
+def _looks_like_transcriber(text: str) -> bool:
+    """Cheap sniff: does this file contain H3 speaker headings?"""
+    return bool(re.search(r"^###\s+\S", text, re.MULTILINE))
+
+
+def _looks_like_canonical(text: str) -> bool:
+    """Cheap sniff: does this file contain inline **Name:** tags?"""
+    return bool(re.search(r"^\*\*[^*\n]+:\*\*", text, re.MULTILINE))
+
+
+def _parse_transcriber_turns(text: str) -> list[dict]:
+    """Parse our transcriber's .md format into canonical turn dicts.
+
+    Skips metadata per D2: bare '---', lines starting with '**Duration:**',
+    and any pre-existing '# Transcript:' title line. Merges consecutive
+    same-speaker H3 blocks into one turn.
+    """
+    turns: list[dict] = []
+    current_speaker: str | None = None
+    buffer: list[str] = []
+
+    def flush() -> None:
+        if current_speaker and buffer:
+            joined = " ".join(s for s in (b.strip() for b in buffer) if s)
+            if joined:
+                turns.append(
+                    {
+                        "index": len(turns),
+                        "speaker": current_speaker,
+                        "text": joined,
+                    }
+                )
+
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        # D2: drop metadata/structural lines
+        if stripped == "---":
+            continue
+        if stripped.startswith("**Duration:**"):
+            continue
+        if stripped.startswith("# Transcript:"):
+            continue
+
+        m = TRANSCRIBER_H3_RE.match(stripped)
+        if m:
+            raw_speaker = _extract_speaker_from_heading(m.group(1))
+            new_speaker = _normalize_speaker_tag(raw_speaker)
+            if new_speaker == current_speaker:
+                # Consecutive block from same speaker — keep accumulating.
+                continue
+            flush()
+            current_speaker = new_speaker
+            buffer = []
+        else:
+            buffer.append(stripped)
+
+    flush()
+    return turns
+
+
+def _parse_canonical_md_turns(text: str) -> list[dict]:
+    """Parse already-canonical '**Speaker N:** text' markdown into turn dicts.
+
+    Handles the re-ingest case where a prior step1 output is fed back in.
+    """
+    turns: list[dict] = []
+    current_speaker: str | None = None
+    buffer: list[str] = []
+
+    def flush() -> None:
+        if current_speaker and buffer:
+            joined = " ".join(s for s in (b.strip() for b in buffer) if s)
+            if joined:
+                turns.append(
+                    {
+                        "index": len(turns),
+                        "speaker": current_speaker,
+                        "text": joined,
+                    }
+                )
+
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            continue  # '# Transcript: ...' title line
+
+        m = CANONICAL_INLINE_RE.match(stripped)
+        if m:
+            flush()
+            current_speaker = m.group(1).strip()
+            first_text = m.group(2).strip()
+            buffer = [first_text] if first_text else []
+        else:
+            # Continuation line (rare — our emitter writes single-line turns)
+            buffer.append(stripped)
+
+    flush()
+    return turns
 
 
 # ---------------------------------------------------------------------------
