@@ -1001,7 +1001,6 @@ def summarize_transcript(
     extractor_model: str = DEFAULT_EXTRACTOR_MODEL,
     ollama_host: str | None = None,
     speaker_map: dict[str, str] | None = None,
-    progress: gr.Progress = gr.Progress(),
 ) -> str:
     """Summarize a meeting transcript into polished meeting minutes.
 
@@ -1012,6 +1011,11 @@ def summarize_transcript(
     Gradio components; this function is the headless equivalent that
     runs the full pipeline to completion and returns the final summary
     as a string.
+
+    No per-step progress notifications are sent to MCP clients — they
+    just wait 3–5 min for the return value. Terminal observability is
+    preserved via the ``announce()`` step banners and the underlying
+    pipeline ``print()`` output.
 
     **Important for agent callers:** action-item attribution quality
     depends on the transcript having real speaker names pre-assigned.
@@ -1034,7 +1038,6 @@ def summarize_transcript(
             var. Omit to use the server default.
         speaker_map: Optional mapping of generic "Speaker N" tags to
             real names. Ignored if empty or None.
-        progress: Injected by Gradio. MCP clients should not pass this.
 
     Returns:
         The final meeting summary as a markdown string, including a
@@ -1078,7 +1081,6 @@ def summarize_transcript(
 
     try:
         # ── Step 1/5: ingest ──────────────────────────────────────────────────
-        progress(0.0, desc="Ingesting transcript")
         announce(1, 5, "Ingesting transcript to Markdown")
         raw_dir = tempdir / "raw_files"
         raw_dir.mkdir(parents=True, exist_ok=True)
@@ -1093,7 +1095,6 @@ def summarize_transcript(
             ) from e
 
         # ── Step 2/5: cleanup ─────────────────────────────────────────────────
-        progress(0.15, desc="Cleaning transcript")
         announce(2, 5, "Cleaning transcript", editor_model)
         cleaned_path = clean_transcript(
             canonical_md, tempdir / "cleaned", editor_model, host
@@ -1106,7 +1107,6 @@ def summarize_transcript(
             cleaned_path = stable_cleaned
 
         # ── Step 3/5: speaker mapping (pure, no model) ──────────────────────
-        progress(0.35, desc="Applying speaker names")
         announce(3, 5, "Applying speaker names")
         cleaned_text = cleaned_path.read_text(encoding="utf-8")
         named_text = apply_speaker_mapping(cleaned_text, speaker_map or {})
@@ -1116,20 +1116,17 @@ def summarize_transcript(
         named_path.write_text(named_text, encoding="utf-8")
 
         # ── Step 4/5: extraction ────────────────────────────────────────────────
-        progress(0.50, desc="Extracting intelligence")
         announce(4, 5, "Extracting intelligence", extractor_model)
         extracted_path = extract_information(
             named_path, tempdir / "extracted", extractor_model, host
         )
 
         # ── Step 5/5: format ───────────────────────────────────────────────────
-        progress(0.75, desc="Formatting final summary")
         announce(5, 5, "Formatting final summary", extractor_model)
         final_path = format_summary(
             extracted_path, tempdir / "final", extractor_model, host
         )
 
-        progress(1.0, desc="Done")
         return final_path.read_text(encoding="utf-8")
 
     except ValueError:
@@ -1286,6 +1283,7 @@ def build_demo() -> gr.Blocks:
                                     _make_updater(name),
                                     inputs=[tb, speaker_map_state],
                                     outputs=[speaker_map_state],
+                                    api_visibility="private",
                                 )
                             else:
                                 gr.Textbox(
@@ -1388,6 +1386,7 @@ def build_demo() -> gr.Blocks:
             on_startup,
             inputs=[session_state],
             outputs=[banner, editor_status, extractor_status, connection_indicator],
+            api_visibility="private",
         )
         demo.load(fn=None, inputs=None, outputs=None, js=FORCE_DARK_MODE_JS)
 
@@ -1401,23 +1400,27 @@ def build_demo() -> gr.Blocks:
                 extractor_status,
                 connection_indicator,
             ],
+            api_visibility="private",
         )
 
         editor_model.change(
             _model_indicator,
             inputs=[ollama_host, editor_model],
             outputs=[editor_status],
+            api_visibility="private",
         )
         extractor_model.change(
             _model_indicator,
             inputs=[ollama_host, extractor_model],
             outputs=[extractor_status],
+            api_visibility="private",
         )
 
         test_btn.click(
             on_test_connection,
             inputs=[ollama_host],
             outputs=[connection_indicator, banner],
+            api_visibility="private",
         )
 
         # Rendered/Raw toggle — pure JS, no Python roundtrip.
@@ -1460,6 +1463,7 @@ def build_demo() -> gr.Blocks:
                 copy_btn,
                 download_btn,
             ],
+            api_visibility="private",
         )
 
         run_event = run_btn.click(
@@ -1485,6 +1489,7 @@ def build_demo() -> gr.Blocks:
                 session_state,
                 stop_btn,
             ],
+            api_visibility="private",
         )
 
         # 9-tuple match for on_stop (no longer needs view_mode /
@@ -1506,6 +1511,7 @@ def build_demo() -> gr.Blocks:
                 stop_btn,
             ],
             cancels=[run_event],
+            api_visibility="private",
         )
 
         copy_btn.click(
@@ -1514,6 +1520,19 @@ def build_demo() -> gr.Blocks:
             outputs=None,
             js=COPY_SUMMARY_JS,
         )
+
+        # ── MCP-exposed tool endpoint ─────────────────────────────────────────
+        # ``gr.api`` registers a Gradio endpoint without binding it to a
+        # UI component — pure logic in, pure data out. When the app is
+        # launched with ``mcp_server=True`` this surfaces as the ONE tool
+        # exposed to MCP clients at ``/gradio_api/mcp/``. All other event
+        # listeners above carry ``api_visibility="private"`` so they
+        # don't pollute the tool list. The four listeners with ``fn=None``
+        # (the JS-only ones: dark-mode load, view-mode toggle,
+        # final_summary_md.change, copy button) are auto-private per
+        # Gradio 6 — see gr.Blocks docs: "If fn is None, api_visibility
+        # will automatically be set to 'private'."
+        gr.api(summarize_transcript, api_name="summarize_transcript")
 
     return demo
 
