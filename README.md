@@ -34,7 +34,7 @@ graph LR
     class OLL infra;
 ```
 
-`main.py` (CLI) is first-class and remains the canonical reference implementation. `app.py` is a **skin over `main.py`** — same pipeline modules, same Ollama contract — that adds a Gradio browser UI on one side and an MCP tool endpoint on the other. The full design spec lives in [`contexts/gradio_app.md`](contexts/gradio_app.md).
+`main.py` (CLI) is first-class and remains the canonical reference implementation. `app.py` is a **skin over `main.py`** — same pipeline modules, same Ollama contract — that adds a Gradio browser UI on one side and an MCP tool endpoint on the other. 
 
 ---
 
