@@ -510,8 +510,8 @@ Every `(host, model)` pair ever loaded during the process's lifetime is tracked 
 - [x] Gradio implementation (chosen for its built-in API and MCP support).
 - [x] Gradio with simple API and MCP (local testing — Tests 1–3).
 - [x] Test MCP with remote / cross-machine file transfer (Test 4: Gradio on ziggie, MCP Inspector on Mac, transcript hosted from Mac via `python -m http.server`, pipeline ran on ziggie's GPUs, summary returned across the LAN).
-- [ ] Test with tool-calling features from Open WebUI (via `mcpo` bridge).
 - [ ] Deploy in Docker.
+- [ ] Test with tool-calling features from Open WebUI (via `mcpo` bridge).
 
 ---
 
