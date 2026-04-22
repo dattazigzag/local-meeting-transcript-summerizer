@@ -387,7 +387,7 @@ The string is written to a per-call tempfile (`.rtf` if it begins with `{\rtf`, 
 
 **When to use which:**
 - Use `file` when your MCP client can give you a URL, path, or lets you base64-encode uploads — Claude Desktop, the MCP Inspector, anything on a shared filesystem. Preserves original RTF formatting if you go that route.
-- Use `content` when your MCP client extracts file text into the LLM's context but doesn't expose a file handle. Open WebUI falls in this bucket today (see [Watching upstream — issue #12228](#watching-upstream--open-webui-issue-12228)).
+- Use `content` when your MCP client extracts file text into the LLM's context but doesn't expose a file handle. Open WebUI falls in this bucket today (see [Open WebUI integration](#open-webui-integration)).
 
 **Unknown / missing values** produce a clear `ValueError`. Passing neither, or both, both produce the same "exactly one must be provided" message. Typos in `file` like `file: http://...` (the literal label text leaking into the value) surface immediately rather than silently misclassifying.
 
@@ -727,25 +727,97 @@ Every `(host, model)` pair ever loaded during the process's lifetime is tracked 
 - [x] Gradio with simple API and MCP (local testing — Tests 1–3).
 - [x] Test MCP with remote / cross-machine file transfer (Test 4: Gradio on ziggie, MCP Inspector on Mac, transcript hosted from Mac via `python -m http.server`, pipeline ran on ziggie's GPUs, summary returned across the LAN).
 - [x] Deploy in Docker — CPU-only image on ziggie, reachable at `ziggie.is:2070`, talks to Ollama via `ziggie-net` container DNS. See [Docker Deployment](#docker-deployment).
-- [x] Test tool-calling from Open WebUI — native MCP Streamable HTTP connection (no `mcpo` bridge needed; we speak Streamable HTTP directly). Upload-in-chat UX validated end-to-end on ziggie's Open WebUI with `.md` transcripts + Gemma 26B via the `content=` parameter. See [Watching upstream — #12228](#watching-upstream--open-webui-issue-12228) for the long-form writeup and what improves once Open WebUI ships file-URL exposure.
+- [x] Test tool-calling from Open WebUI — native MCP Streamable HTTP connection (no `mcpo` bridge needed; we speak Streamable HTTP directly). Upload-in-chat UX validated end-to-end on ziggie's Open WebUI with `.md` transcripts + Gemma 26B via the `content=` parameter. See [Open WebUI integration](#open-webui-integration) for the full writeup.
+- [ ] Check frombehind https (caddy) ziggie
+- [ ] Document https stuff in here and in the man ziggie maintainece repo
 
 ---
 
-## Watching upstream — [Open WebUI issue #12228](https://github.com/open-webui/open-webui/issues/12228)
+## Open WebUI integration
+
+Open WebUI is a popular local-LLM chat UI that speaks MCP natively. Our tool is exposed at `/gradio_api/mcp/` as a Streamable HTTP endpoint — Open WebUI connects to it directly, no `mcpo` bridge needed. This section walks through how the integration works today, what you can upload (and what works best), why the shape is what it is, and what improves if Open WebUI ever ships its long-pending file-URL-exposure feature.
+
+### Today: summarizing a transcript from an Open WebUI chat
+
+Validated end-to-end on ziggie's Open WebUI + Gemma 26B, April 2026. The flow:
+
+1. **Connect the MCP tool** in Open WebUI's Settings → Tools. Point its **MCP Streamable HTTP** connector at `http://ziggie.is:2070/gradio_api/mcp/`. Gemma will now see `summarize_transcript` in its available-tools list.
+2. **Set the system prompt** (see [below](#suggested-system-prompt-for-gemma-in-open-webui)) so Gemma knows to call the tool with `content=` and paste the returned summary verbatim.
+3. **Upload a transcript in chat** — drag & drop, or the paperclip icon. Open WebUI extracts the file's text and puts it into Gemma's context.
+4. **Ask Gemma to summarize.** With the system prompt in place, `summarize this` is enough. Gemma calls `summarize_transcript(content=<the extracted text>)`, our server runs the 5-step pipeline on ziggie's GPUs (~3–5 min), and Gemma pastes the returned markdown summary into the chat reply.
+
+A side echo-back test we ran showed Gemma introduces ~<1% word-level noise when re-typing the transcript into the tool-call JSON (one missed vowel in a speaker name, a few inserted `and`s). Step 2 (cleanup) absorbs that as part of its normal fillers-and-stutters pass, so final summary quality is indistinguishable from a direct Web UI upload.
+
+#### What you can upload (and what to expect)
+
+| Format | Verdict | Why |
+| :--- | :--- | :--- |
+| `.md` from our local transcriber | ✅ **Recommended.** | Open WebUI's extractor passes markdown through near-losslessly. Speaker labels (`### Chris Hayes [00:00 → 00:51] EN`) and structure survive intact. This is the sweet spot for the `content=` path. |
+| `.rtf` from Moonshine | ⚠️ **Works but lossy.** | Open WebUI strips RTF formatting via `striprtf` before injecting text. Bold `**Speaker N:**` labels may flatten into plain prose, which degrades speaker attribution. Pass `speaker_map` to compensate, or convert the RTF to `.md` first and upload that. |
+| Multi-MB `.rtf` (long meetings) | ❌ **Avoid.** | Open WebUI's extractor hits a reconnect loop on large RTFs — known bad path. Use the Web UI directly, or the [LAN URL fallback](#lan-url-filehttp) below. |
+| Plain `.txt` or other formats | ❌ **Won't work.** | Step 1 only accepts `.rtf` and `.md`. The upload will either fail at OWUI or our server will return a `ValueError`. |
+
+#### Critical Open WebUI setting
+
+> [!Warning]
+> **In the chat input bar, toggle ON `Use Entire Document` for the uploaded file.** Otherwise Open WebUI treats the upload as RAG input and only injects chunks, so Gemma's tool call gets fragmented text instead of the full transcript — you'll get a summary of a few paragraphs, not the meeting.
+> ![Use Entire Document toggle in Open WebUI](assets/use_entire_doc.png)
+
+#### Suggested system prompt for Gemma in Open WebUI
+
+```text
+When the user uploads a meeting transcript and asks for a summary,
+call the summarize_transcript tool. Pass the uploaded file's text
+verbatim as the `content` argument — do not trim, clean, or
+reformat the transcript before passing it. If you can identify
+speakers' real names from context, pass them as `speaker_map`
+like {"Speaker 1": "Alice", "Speaker 2": "Bob"}. Paste the
+returned markdown summary verbatim into your reply — do not
+re-summarize the summary.
+```
+
+With that in place, the user's chat message can be as short as `summarize this` after an upload.
+
+#### Size guidance
+
+The `content=` path is comfortable up to **~30–40 min of talk** (~3–4k words). Beyond that, two distinct problems stack:
+
+1. **Context-window pressure.** The transcript crowds Gemma's ~32k-token context window, leaving little room for the tool schema, prior conversation turns, and the response itself.
+2. **Output-token truncation.** Gemma has to emit the full transcript back out as its tool-call output. Ollama's default `num_predict` is 128 — comically too small for anything meaningful. Bump it to 8000–16000 in your Open WebUI model settings. Symptom of hitting this: malformed tool-call errors, or summaries that only cover the first few minutes of a long meeting.
+
+For anything beyond ~40 min, skip `content=` and use the [LAN URL fallback](#lan-url-filehttp) below — a URL is ~50 tokens regardless of file size, so neither problem applies.
+
+### Why it works this way
+
+Open WebUI doesn't give tools a handle to the uploaded file. When a user uploads anything in a chat, Open WebUI runs it through RAG / OCR / text extraction and injects the *extracted text* into the LLM's context prompt. Gemma therefore sees the file only as text already in its context — never as a path, URL, or base64 payload.
+
+That means `file=` (which expects a reference) can't be used from an Open WebUI-driven chat. Our `content=` parameter exists specifically for this shape: it accepts the raw text body as a string, writes it to a per-call tempfile, and feeds it into step 1 exactly like a direct upload would. When the extracted text is already in our canonical `**Speaker N:**` form (which is true for `.md` inputs), the pipeline runs identically to a Web UI upload — same quality, same behaviour.
+
+See [Input sources](#input-sources--file-by-reference-vs-content-by-value) for the full contract of `file=` vs `content=`.
+
+### Fallbacks when `content=` isn't enough
+
+#### LAN URL (`file=http://...`)
+
+For long transcripts, or when you want the LLM's context window to stay clean, serve the file from your laptop with `python3 -m http.server 8000`, paste the URL into chat, and tell Gemma to call the tool with `file=<URL>`. See [Cross-machine topology](#cross-machine-topology) for the exact setup.
+
+A URL is tiny in tokens regardless of file size, so neither the context-pressure nor the output-truncation problems apply. Best choice for 1h+ meetings until upstream #12228 lands.
+
+#### Open WebUI Filter Function (advanced, rarely needed)
+
+A Python plugin running inside Open WebUI that intercepts uploads before extraction and pre-fills the `content=` argument automatically — so the user doesn't even need to mention the tool by name. Most invasive, most automated. We'd own a maintenance surface in someone else's codebase. Only worth building if `content=` + a good system prompt proves insufficient at scale, which so far it hasn't.
+
+### Future: Open WebUI issue #12228
 
 > [!Important]
-> **Status as of April 2026:** OPEN. Filed on 31 March 2025 by `wangjiyang`, assigned to `tjbck` (Open WebUI project lead), with no labels, no linked PR, and no development branch. It's sitting in the backlog with no ETA.
+> **Status as of April 2026:** [Issue #12228](https://github.com/open-webui/open-webui/issues/12228) is OPEN. Filed 31 March 2025 by `wangjiyang`, assigned to `tjbck` (Open WebUI project lead), no labels, no linked PR, no development branch. Sitting in the backlog with no ETA.
 
-There's one piece of our UX that's blocked on Open WebUI, not on us: **drag a transcript into the chat window, let Gemma call our `summarize_transcript` tool automatically, get the summary back in the conversation.** Today, Open WebUI intercepts every file uploaded to a chat, runs it through RAG / OCR / text extraction, and injects the *extracted text* into the LLM's context prompt. The LLM (Gemma, in our case) therefore never sees the file as a handle — only as a pile of text already in its context — so when it tries to call our tool it has no path, URL, or base64 payload to pass as the `file=` argument. The natural UX falls apart at that boundary.
+The issue, titled *"feat: uploading files without backend processing"*, asks Open WebUI to:
 
-Issue #12228, titled *"feat: uploading files without backend processing"*, asks for exactly the two things that would fix this:
+1. **Bypass the content-extraction pipeline entirely** when a user uploads a file — no RAG, no OCR, no text injection.
+2. **Expose the raw uploaded file via a URL** that tools / pipelines can fetch.
 
-1. **Bypass Open WebUI's content-extraction pipeline entirely** when the user uploads a file — no RAG, no OCR, no text injection into the prompt.
-2. **Expose the raw uploaded file to tools / pipelines via a URL** that the backend can fetch.
-
-### What lands in our lap the day it ships
-
-The fix is nearly free for us, because our MCP tool already accepts a URL as the `file` argument (see [Input sources](#input-sources--file-by-reference-vs-content-by-value)). Once Open WebUI exposes uploaded files via a URL, the topology becomes:
+If this ships, our integration gets both simpler and stronger. The topology becomes:
 
 ```mermaid
 graph LR
@@ -772,63 +844,15 @@ graph LR
     class TOOL,PIPE tool;
 ```
 
-Zero code changes on our side for the URL-based route. The `http(s)://...` branch of `_materialize_input` already streams the file down via `httpx` before handing off to step 1. Whatever URL shape Open WebUI picks (signed, session-scoped, whatever) just flows through. The main win is that the LLM's context window stays clean — no big transcript text cluttering it up as intermediate state.
+Zero code changes on our side — our `file=http(s)://...` branch already handles URL-based fetches. What we'd gain:
 
-### Today's workarounds (even before #12228 lands)
+- **Clean LLM context.** No transcript text crowding Gemma's 32k tokens; the tool call is just a tiny URL. More room for back-and-forth conversation.
+- **No output-token budget risk.** Gemma doesn't need to re-emit the transcript, so the `num_predict` ceiling stops mattering.
+- **Much larger meetings supported.** 2h+ transcripts become viable without any `content=` size tricks.
+- **No echo-back drift.** The transcript goes to our server as raw bytes from a URL, so Gemma's ~<1% re-typing noise disappears.
+- **RTF preserved.** Moonshine `.rtf` can be fetched as-is and step 1 strips it server-side — no more Open WebUI `striprtf` collateral damage.
 
-#### 1. Paste extracted text directly via `content=` (recommended)
-
-Our MCP tool has a `content` parameter that accepts raw transcript text as a string — see [Input sources](#input-sources--file-by-reference-vs-content-by-value). This is exactly the shape Open WebUI already gives Gemma: the file's extracted text, sitting in the chat context. Gemma just copies it into the tool call:
-
-```
-You: [uploads meeting.md]
-You: summarize this meeting
-Gemma: [calls summarize_transcript(
-          content="<the entire transcript text Open WebUI put in my context>",
-          speaker_map={"Speaker 1": "Alice"},
-        )]
-Gemma: [pastes the returned markdown summary into chat]
-```
-
-Works today, no upstream fix needed. Quality trade-off: for `.md` uploads from our local transcriber the round-trip is lossless. For Moonshine `.rtf` uploads, Open WebUI's RTF-to-text extractor may lose speaker labels — if action items come back with `(unnamed)` owners, pass a `speaker_map` so the extraction step still gets attribution right.
-
-**Validated end-to-end** (April 2026): an `.md` transcript uploaded to ziggie's Open WebUI, passed to Gemma 26B, then through `summarize_transcript(content=...)` produced a clean summary with correct speaker attribution. A side echo-back test showed Gemma's own re-typing of the transcript into the tool-call JSON introduces minor noise (~<1% word-level drift — added / missing `and`s, one `Zerosny → Zersny` typo across ten speaker-label headings); step 2 (cleanup) absorbs that noise as part of its normal fillers-and-stutters pass, so final summary quality is indistinguishable from a direct file upload via the Web UI.
-
-**Suggested system prompt for Gemma4 in Open WebUI:**
-
-```text
-When the user uploads a meeting transcript and asks for a summary,
-call the summarize_transcript tool. Pass the uploaded file's text
-verbatim as the `content` argument — do not trim, clean, or
-reformat the transcript before passing it. If you can identify
-speakers' real names from context, pass them as `speaker_map`
-like {"Speaker 1": "Alice", "Speaker 2": "Bob"}. Paste the
-returned markdown summary verbatim into your reply — do not
-re-summarize the summary.
-```
-
-With that system prompt in place, the user's chat message can be as short as `summarize this` after an upload — the system prompt drives the rest.
-
-> [!Warning]
-> When uploading document to `openwebui` chat (with LLM set to `gemma4:26B`), do not forget to toggle ON `Use Entire Document`
-> ![alt text](assets/use_entire_doc.png)
-
-**Practical size guidance.** The `content=` path works well for transcripts up to ~30-40 minutes of talk (~3-4k words). Beyond that, two problems stack:
-
-1. The transcript crowds out Gemma's ~32k-token context window, leaving little room for the tool schema, prior turns, and the response itself.
-2. Gemma must emit the full transcript as its tool-call output. Ollama's default `num_predict` is 128, which silently truncates the JSON mid-transcript and produces a malformed tool call. Bump it to 8000–16000 in your Open WebUI model settings if you're getting "tool call was cut off" errors on longer meetings.
-
-For very long meetings, prefer workaround **LAN URL** below — a URL is ~50 tokens regardless of file size, so the LLM's context window stays uncrowded and there's no output-token-budget risk.
-
-#### 2. Share a LAN URL
-
-If you want the LLM to fetch the transcript itself (no text in context, no token cost), serve it from your laptop with `python3 -m http.server 8000`, paste the URL into chat, and ask Gemma to call the tool with `file=<URL>`. See [Cross-machine topology](#cross-machine-topology) for the exact setup. Best for very long transcripts that would blow the LLM's context budget if pasted inline via `content=`.
-
-#### 3. Open WebUI Filter Function (advanced, rarely needed)
-
-Most invasive, most automated — a Python plugin running inside Open WebUI that intercepts uploads before extraction and pre-fills the `content=` argument automatically, so the user doesn't even have to ask Gemma to call the tool by name. We own a maintenance surface in someone else's codebase. Only worth it if `content=` + a good system prompt doesn't automate the flow reliably enough.
-
-So #12228 would be nice (cleaner LLM context, signed-URL access), but it's no longer a blocker. The `content=` workaround covers the Open WebUI demo path cleanly today.
+Until then, `content=` covers the demo path cleanly for small-to-medium meetings, and the LAN URL fallback handles anything bigger. Issue #12228 would turn those two workarounds into a single universal path, but it's genuinely "nice to have," not a blocker.
 
 
 ---
