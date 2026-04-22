@@ -6,7 +6,7 @@ services:
     ports:
       - "2070:2070"
     environment:
-      - OLLAMA_HOST=${OLLAMA_HOST:-http://ollama:11434}
+      - OLLAMA_HOST=http://ollama:11434
       - PYTHONUNBUFFERED=1
     volumes:
       - /data/services/meeting-summarizer/outputs:/app/output
