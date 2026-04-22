@@ -1,7 +1,7 @@
 services:
   meeting-summarizer:
     build: .
-    container_name: meeting-summarizer
+    container_name: meeting-transcript-summarizer
     restart: unless-stopped
     ports:
       - "2070:2070"
