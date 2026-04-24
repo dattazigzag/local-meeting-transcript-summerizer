@@ -9,6 +9,5 @@ dependencies = [
     "gradio[mcp]>=6.13.0",
     "markdown-pdf>=1.13.1",
     "ollama>=0.6.1",
-    "pymupdf-fonts>=1.0.5",
     "striprtf>=0.0.29",
 ]
